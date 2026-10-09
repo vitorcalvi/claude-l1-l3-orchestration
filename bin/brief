@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# brief - write a validated dispatch delta from a goal and acceptance lines
+# alone (l1opt lane J).
+#
+# Usage:
+#   brief new <recon|build|verify> --goal TEXT --accept TEXT [--accept TEXT]...
+#       [--scope TEXT] [--owned PATH] [--repo NAME] [--base REF] [--lane LANE]
+#       [--test CMD] [-o OUT] [--report PATH] [--max-deletes N] [--effort LEVEL]
+#   brief new --help
+#
+# The delta itself is written by the sibling helper mac-bin/brief.py, which
+# emits every section dispatch requires (effort, execution, lane, goal,
+# user_request, scope, non_goals, constraints, acceptance, evidence_required,
+# unknowns, remote_worker, remote_mode, remote_test_cmd, remote_repo,
+# remote_base) and validates the result before it writes it. This wrapper only
+# locates the helper and hands the arguments over untouched, so `brief` and
+# `python3 mac-bin/brief.py` can never disagree.
+#
+# bash 3.2 compatible, because the macOS system bash is 3.2: plain parameter
+# expansion and plain command substitution only, nothing newer.
+#
+# Exit codes: 0 the delta was written, 1 invalid input or invalid delta,
+# 2 usage. Nothing here is installed live: the helper is read from this
+# directory (override with BRIEF_PY to run a staged copy elsewhere).
+main() {
+set -euo pipefail
+
+PROG="${0##*/}"
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+HELPER="${BRIEF_PY:-$SELF_DIR/brief.py}"
+
+if [ ! -f "$HELPER" ]; then
+  printf '%s: helper not found: %s\n' "$PROG" "$HELPER" >&2
+  exit 1
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+  printf '%s: python3 not found on PATH\n' "$PROG" >&2
+  exit 1
+fi
+
+exec python3 "$HELPER" "$@"
+}
+
+main "$@"

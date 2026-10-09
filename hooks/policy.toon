@@ -1,0 +1,428 @@
+# claude-hooks/policy.toon
+# L1 capability policy (lane F) consumed by claude-hooks/l1-policy.py.
+#
+# Shape: this is a TOON document. Two constructs are used and both are parsed
+# by the hook's `parse_toon()`:
+#
+#   key: value                 -> scalar setting
+#   name[N]{f1,f2,f3}:         -> tabular block, N rows of 3 comma separated fields
+#
+# A field is wrapped in TOON double quotes when it contains a comma, a colon,
+# quotes or brackets. `\` escapes inside a quoted field.
+#
+# The policy is a CAPABILITY allow-list. Anything the hook does not recognise
+# as an allowed capability is denied. There is no "everything except" mode.
+
+policy_version: 1
+policy_id: l1-plan-and-dispatch
+
+# --- mode --------------------------------------------------------------------
+# shadow or enforce. This is the fallback used when neither `--mode` nor
+# L1_POLICY_MODE is set, so it is how an operator flips the whole hook.
+#
+# shadow: the hook evaluates the same policy, appends one redacted JSON line to
+# the shadow audit log with "shadow": true and exits 0 with no output, so
+# nothing is blocked and the deny list can be measured first.
+#
+# enforce: the decision goes to stdout and Claude Code acts on it. The deny
+# list moves here once infra-proxy is live and the shadow log shows the
+# traffic that would have been refused.
+mode: shadow
+
+# Where a shadow run writes its one line per tool call.
+shadow.audit_log: shadow-audit.jsonl
+# The one sentence every denial ends with. Keep it byte-for-byte stable:
+# the tests and the README both quote it.
+deny_reason: write a brief and dispatch
+
+# --- soft budget -------------------------------------------------------------
+# Tool calls are counted per session in the state file. Above soft_limit the
+# decision is unchanged but a warning is appended to the reason. Above
+# soft_limit * ask_multiplier an otherwise allowed call becomes `ask`. The
+# budget never turns into a deny.
+budget.soft_limit: 40
+budget.ask_multiplier: 2
+
+# Tools the harness calls on its own behalf rather than on the model's. They
+# are decided like any other call but do not consume the soft budget, so a
+# background poll cannot eat a session's allowance. ListAgents alone was asked
+# 2652 times in the shadow review.
+budget.exempt_tools[2]{name,note}:
+  ListAgents,harness polls the background agent list
+  ToolSearch,harness resolves a tool name to its schema
+
+# Appended to an `ask` reason so the model knows the cheap way forward.
+dispatch_hint: "plan and dispatch instead: write a brief under .claude/plans and dispatch it"
+
+# ============================================================================
+# Bash capabilities. argv0 is matched on the basename of the first word of
+# every segment, after env/sudo/timeout/... wrappers are peeled off.
+# ============================================================================
+
+# Capabilities the L1 session is allowed to run directly. Each one is a
+# sanctioned, self-limiting entry point into the remote fleet.
+bash_capabilities[11]{argv0,capability,note}:
+  dispatch,dispatch,hand a delta to a worker lane and get REMOTE_JOB_ID back
+  dispatch-plan,dispatch-plan,split a task into slots and dispatch them
+  remote-worker,remote-worker,wait/digest/fetch for an already dispatched job
+  infra-lock,infra-lock,serialise access to shared infrastructure state
+  fleet-metrics,fleet-metrics,TOON baseline of tokens cost latency retries
+  toon-lint,toon-lint,validate a TOON file or directory
+  brief,brief,author and lint the brief that dispatch consumes
+  brief-lint,brief-lint,check a brief against the brief rules
+  validate-result,validate-result,validate a worker result envelope
+  secret-scan,secret-scan,report masked secret hits and nothing else
+  orch-status,orch-status,short status line for the local slots
+
+# Read-only commands with no path constraint: they print what is already on
+# disk and cannot mutate the filesystem or reach the network.
+#
+# The file readers (cat/grep/ls/find/...) used to be scoped to the home .claude
+# directory. The shadow review showed that scoping to be the single largest
+# source of false positives: a planning session has to read the repository it
+# is planning for, so `cat PROTOCOL.md` and `ls` with no path at all came back
+# denied as unknown. Reading is now free. What stays closed is writing,
+# executing anything, and every remote reach:
+#   * `bash_read_guards` keeps the three readers that can write in their
+#     print-only form,
+#   * `bash_read_denied_paths` carves credentials back out.
+bash_read_any[31]{argv0,note}:
+  pwd,print working directory
+  echo,print a literal
+  true,no-op
+  false,no-op with non-zero status
+  date,print the clock
+  whoami,print the current user
+  uname,print kernel identity
+  jq,filter JSON on stdout
+  cd,set the working directory for the segments that follow
+  read,read one line of stdin into variables
+  test,evaluate a file and string comparison
+  [,evaluate a file and string comparison
+  cat,print a file or stdin
+  head,print the first lines of a file or stdin
+  tail,print the last lines of a file or stdin
+  wc,count lines words bytes in a file or stdin
+  grep,search file contents or stdin
+  egrep,search file contents or stdin
+  rg,search file contents or stdin
+  ls,list a directory or the working directory
+  sed,print the lines a script selects
+  sort,sort lines
+  uniq,collapse repeated lines
+  cut,select fields or characters from each line
+  awk,filter lines through a program
+  diff,compare two files or directories
+  cmp,compare two files byte for byte
+  shasum,print the SHA digest of a file
+  stat,print file metadata
+  file,print the type of a file
+  find,walk a directory tree
+
+# Restrictions on the arguments of a reader in `bash_read_any`. `mode` is how
+# the guard is applied to the segment's arguments:
+#   require_flag  - the flag must be present
+#   forbid_flag   - the flag must not be present
+#   forbid_char   - no argument may contain the character
+#   forbid_text   - no argument may contain the substring
+# For `awk` the character guards run against the program with its `/regex/`
+# literals masked, so `awk '/foo|bar/'` stays allowed while `awk '{print | "sh"}'`
+# does not: an awk program is an inline interpreter, and it runs what it pipes.
+# Its comparison operators are masked too, so `awk 'NR>1 {print $2}' f.csv`
+# stays allowed while `awk '{print > "out"}' f.txt` still denies.
+# A character guard skips option tokens, because `-F'|'` sets a separator rather
+# than piping anywhere. `awk -f prog` is denied outright instead: it runs a
+# program from a path the policy has never seen.
+# A reader that trips a guard is denied, so the form is never a way around the
+# allow-list.
+bash_read_guards[18]{argv0,mode,value,note}:
+  sed,require_flag,-n,without -n sed prints every line of the file it edits
+  sed,forbid_flag,-i,-i rewrites the file in place
+  sed,forbid_flag,--in-place,--in-place rewrites the file in place
+  find,forbid_flag,-exec,-exec re-invokes another program per match
+  find,forbid_flag,-execdir,-execdir re-invokes another program per match
+  find,forbid_flag,-ok,-ok runs another program per match
+  find,forbid_flag,-okdir,-okdir runs another program per match
+  find,forbid_flag,-delete,-delete removes what it matched
+  find,forbid_flag,-fprint,-fprint writes the matches to a file
+  find,forbid_flag,-fprintf,-fprintf writes the matches to a file
+  find,forbid_flag,-fprint0,-fprint0 writes the matches to a file
+  find,forbid_flag,-fls,-fls appends the matches to a file
+  awk,forbid_flag,-f,-f runs the awk program held in a file
+  awk,forbid_flag,--file,--file runs the awk program held in a file
+  awk,forbid_char,>,an awk program redirects its output into a file
+  awk,forbid_char,<,an awk program reads from a file it was not given
+  awk,forbid_char,|,an awk program pipes into a program it names
+  awk,forbid_text,system(,awk system() runs another program
+
+# Reading is free; reading a credential is not. A reader whose arguments
+# resolve onto one of these globs is denied. The globs are matched against the
+# resolved absolute path, so `~/.ssh/id_rsa` and `../../.env` land on the same
+# glob as `/home/user/.ssh/id_rsa`.
+bash_read_denied_paths[14]{glob,note}:
+  "~/.ssh/**",ssh keys and known_hosts
+  "**/.ssh/**",ssh keys in any checkout
+  "**/id_rsa*",ssh private key
+  "**/id_ed25519*",ssh private key
+  "**/id_ecdsa*",ssh private key
+  "**/*.pem",private key or certificate
+  "**/*.key",private key
+  "**/.env",dotenv file
+  "**/.env.*",dotenv file
+  "**/.netrc",credential file
+  "**/.npmrc",credential file
+  "**/.git-credentials",credential file
+  "**/.aws/credentials",credential file
+  "**/etc/shadow",system password hashes
+
+# Read-only commands that are only allowed when they stay inside the home
+# .claude directory (the session memory, plan and prompt store).
+# stdin_ok says whether the command may run with no path argument at all. A
+# reader with stdin_ok=yes and no path reads the pipe, not the filesystem, so
+# `toon-lint f | head -3` stays inside the boundary. ls/find/tree read the
+# working directory when given no path and therefore have stdin_ok=no.
+# Every plain reader moved to `bash_read_any` when the shadow review showed the
+# scoping was a false positive; only `tree` is still scoped, because it prints a
+# whole tree at once and the session has no reason to need one it cannot name.
+bash_read_claude_home[1]{argv0,stdin_ok,note}:
+  tree,no,print a directory tree
+
+# Leading shell syntax that is not a program. `parse_commands()` splits on the
+# separators, so `NAME=value; cmd` and `for f in a b; do cat $f; done` arrive as
+# segments that begin with an assignment or a keyword. The hook strips them
+# and classifies what is left, so a variable assignment or a loop header is
+# never mistaken for an unknown capability.
+shell_syntax_keywords[12]{keyword,note}:
+  if,conditional header
+  then,conditional body marker
+  elif,conditional alternative
+  else,conditional alternative
+  fi,conditional terminator
+  while,loop header
+  until,loop header
+  for,loop header
+  do,loop body marker
+  done,loop terminator
+  case,case header
+  esac,case terminator
+
+# Assignments to these are not stripped as harmless setup: each one changes
+# how the *next* allowed program behaves, which would smuggle code in through
+# a loader or an interpreter.
+shell_assignment_denied[7]{name,note}:
+  LD_PRELOAD,loads a shared object into every allowed program
+  LD_LIBRARY_PATH,changes which shared objects are loaded
+  LD_AUDIT,loads an audit shared object
+  DYLD_INSERT_LIBRARIES,loads a shared object on macOS
+  DYLD_LIBRARY_PATH,changes which shared objects are loaded on macOS
+  BASH_ENV,sources a file before every bash command
+  PYTHONPATH,changes which modules an interpreter imports
+
+# git sub-commands that only read. Anything else under git is a write and is
+# denied: the L1 session never commits, never branches, never pushes.
+git_read_subcommands[13]{subcommand,note}:
+  status,working tree summary
+  log,commit history
+  show,one commit or one object
+  diff,compare trees or the working tree
+  blame,line provenance
+  branch,list branches
+  tag,list tags
+  remote,configured remotes
+  rev-parse,resolve a ref to an object id
+  describe,human readable ref name
+  ls-files,tracked file list
+  shortlog,commit counts by author
+  config,--get reads only; --set is denied by the write guard below
+
+# A read-only git sub-command that is handed one of these flags is a write.
+# `git config --get ...` stays readable; `git config --set` does not.
+git_write_flags[8]{flag,note}:
+  --set,write a config value
+  --add,append a config value
+  --unset,remove a config value
+  --unset-all,remove every config value
+  --global,write the user config
+  --system,write the system config
+  --force,force a ref or gc update
+  --delete,delete a branch or tag
+
+# Commands that reach a remote host, a container runtime or the network.
+# Denied with `deny_reason` regardless of how they are chained.
+bash_denied[23]{argv0,category,note}:
+  ssh,remote,ssh to any host
+  ssh-add,remote,load an ssh key
+  scp,remote,copy to or from a remote host
+  sftp,remote,sftp session
+  rsync,remote,rsync to or from a remote host
+  mosh,remote,mosh session
+  docker,container,docker client
+  podman,container,podman client
+  nerdctl,container,nerdctl client
+  kubectl,cluster,kubernetes client
+  curl,network,fetch a URL
+  wget,network,fetch a URL
+  nc,network,netcat
+  ncat,network,ncat
+  netcat,network,netcat
+  telnet,network,telnet
+  ftp,network,ftp client
+  ansible,remote,run playbooks against remote hosts
+  systemctl,host,change service state
+  sudo,host,elevate privileges
+  doas,host,elevate privileges
+  launchctl,host,change macOS service state
+  osascript,host,script the host
+
+# Interpreters and inline evaluators. Running arbitrary code is the same as
+# running any program at all, so they are denied by category. `python3 -c`,
+# `node -e` and friends are covered by argv0 alone.
+bash_denied_interpreters[10]{argv0,category,note}:
+  python3,code,interpret a program
+  python,code,interpret a program
+  bash,code,start a shell
+  sh,code,start a shell
+  zsh,code,start a shell
+  dash,code,start a shell
+  perl,code,interpret a program
+  ruby,code,interpret a program
+  node,code,interpret a program
+  eval,code,evaluate a string as a command
+
+# argv0 values that are never capabilities, whatever else follows them. Listed
+# so the denial reason is specific instead of the generic unknown fallback.
+# An argv0 that has a more specific category elsewhere (eval is an inline
+# evaluator, in bash_denied_interpreters above) is listed only once, in the
+# table that describes it best.
+bash_denied_extra[7]{argv0,category,note}:
+  xargs,smuggle,xargs re-invokes argv0 for every input line
+  env,smuggle,env re-invokes argv0
+  nohup,smuggle,nohup re-invokes argv0
+  setsid,smuggle,setsid re-invokes argv0
+  command,smuggle,command re-invokes argv0
+  exec,smuggle,exec replaces the shell with argv0
+  watch,smuggle,watch re-invokes argv0
+
+# Wrappers that only put a bound around exactly one command, so the command
+# they wrap is still fully classified. `timeout 30 git status` is git status
+# with a deadline. These are peeled rather than denied, unlike the smuggle
+# table above: `timeout 30 ssh host` is still an ssh and stays denied.
+shell_wrappers[1]{argv0,note}:
+  timeout,run one command with a deadline
+
+# `timeout` flags that consume the next argument as their value, so peeling
+# them does not mistake the value for the wrapped command.
+shell_wrapper_value_flags[4]{flag,note}:
+  -k,kill-after duration
+  --kill-after,kill-after duration
+  -s,signal name
+  --signal,signal name
+
+# A LAN address, a loopback address or a known fleet hostname appearing in a
+# segment that is not itself an allowed capability is a remote reach.
+lan_address_re[1]{pattern}:
+  "(^|[^0-9a-zA-Z._-])(10\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}|192\\.168\\.[0-9]{1,3}\\.[0-9]{1,3}|172\\.(1[6-9]|2[0-9]|3[01])\\.[0-9]{1,3}\\.[0-9]{1,3}|169\\.254\\.[0-9]{1,3}\\.[0-9]{1,3}|127\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}|localhost|host\\.docker\\.internal|zeroclaw[0-9]*|zeroclaw-host)([^0-9a-zA-Z._-]|$)"
+
+# ============================================================================
+# Native Claude Code tools. `decision` is allow, deny or ask.
+# ============================================================================
+
+# The harness drives a lot of the session: it polls the agent list, resolves
+# tool schemas, runs the task bookkeeping and puts questions to the operator.
+# None of that is a capability the model is spending, and the shadow review
+# asked 2652 questions about ListAgents alone, so they are all allowed here.
+# The two the harness makes in the background are additionally exempt from
+# the soft budget: see budget.exempt_tools.
+tools[24]{name,decision,note}:
+  Read,allow,read a file into context
+  Glob,allow,list paths by pattern
+  Grep,allow,search the working tree
+  NotebookRead,allow,read a notebook cell
+  LS,allow,list a directory
+  TodoWrite,allow,track the plan
+  EnterPlanMode,allow,enter plan mode before writing the brief
+  ExitPlanMode,allow,hand the finished plan back
+  ListAgents,allow,harness polls the background agent list
+  SendMessage,allow,send a message to a running agent
+  ToolSearch,allow,resolve a tool name to its schema
+  AskUserQuestion,allow,put a question to the operator
+  TaskCreate,allow,create a task on the todo list
+  TaskGet,allow,read one task
+  TaskList,allow,list the tasks
+  TaskUpdate,allow,update a task
+  TaskStop,allow,stop a task
+  ScheduleWakeup,allow,schedule a later wake-up
+  Skill,allow,run a skill from the plugin list
+  WebFetch,deny,reaches a remote host
+  WebSearch,deny,reaches a remote host
+  Task,ask,a subagent could implement the change instead of dispatching it
+  KillShell,allow,stop a background shell
+  Bash,policy,evaluated by the Bash capability tables above
+
+# Write-like tools. The `name` list is the set that gets the path rule; every
+# other write-like tool falls through to the generic `tools` table above.
+write_tools[4]{name,note}:
+  Write,create or replace a file
+  Edit,replace bytes inside a file
+  MultiEdit,several Edit operations in one call
+  NotebookEdit,replace a notebook cell
+
+# The only paths Write/Edit/MultiEdit/NotebookEdit may touch. Anything outside
+# these globs is denied: the L1 session plans, it does not implement.
+write_allowed_paths[6]{glob,note}:
+  "~/.claude/memory/**",session memory
+  "~/.claude/plans/**",plans and briefs
+  "~/.claude/prompts/**",prompt drafts
+  "**/.claude/memory/**",repo local session memory
+  "**/.claude/plans/**",repo local plans
+  "**/.claude/prompts/**",repo local prompt drafts
+
+# Path fields a write-like tool may carry, most specific first.
+write_path_keys[6]{key,note}:
+  file_path,primary path field
+  notebook_path,notebook primary path field
+  path,generic path field
+  filePath,camelCase generic path field
+  new_path,rename target
+  target_path,move target
+
+# ============================================================================
+# MCP tools. MCP is a capability too: it is granted per tool name, not per
+# server, and an unlisted tool is asked about rather than denied so a new
+# server cannot silently widen the session.
+# ============================================================================
+
+mcp_tools[8]{name,decision,note}:
+  mcp__fleet__metrics,allow,token and cost baseline
+  mcp__fleet__retries,allow,retry counters
+  mcp__jobs__status,allow,local job status
+  mcp__jobs__envelope,allow,validate one job result envelope
+  mcp__dispatch__brief,allow,write a brief
+  mcp__toon__lint,allow,validate a TOON file
+  mcp__web__fetch,deny,reaches a remote host
+  mcp__ssh__exec,deny,reaches a remote host
+
+# ============================================================================
+# Override. Set L1_POLICY_OVERRIDE to a non-empty reason to allow a call the
+# policy would refuse, and to record an audit line. Secrets are referenced by
+# variable name only; the audit log stores the command redacted.
+# ============================================================================
+
+override.env_var: L1_POLICY_OVERRIDE
+override.audit_log: override-audit.jsonl
+override.redact_value_keys[6]{key}:
+  token
+  api_key
+  apikey
+  secret
+  password
+  passwd
+
+# Assignment prefixes whose value is masked in reasons and in the audit log.
+redact_assignments[6]{prefix}:
+  L1_API_KEY
+  OPENAI_API_KEY
+  ANTHROPIC_API_KEY
+  MINIMAX_API_KEY
+  AWS_SECRET_ACCESS_KEY
+  GITHUB_TOKEN

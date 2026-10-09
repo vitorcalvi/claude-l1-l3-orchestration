@@ -1,0 +1,21 @@
+{
+  "enable": true,
+  "watchlist": [],
+  "fallback_watchlist": ["SMCI", "INTC", "BMNR", "MU", "MRNA", "BA"],
+  "context": ["SPY", "QQQ", "IWM"],
+  "market_ttl_s": 60,
+  "news_ttl_s": 120,
+  "macro_ttl_s": 1800,
+  "news_max_age_min": 240,
+  "macro_horizon_h": 24,
+  "market_stale_s": 600,
+  "max_chars": 120,
+  "llm": {
+    "enable": true,
+    "base_url": "http://zeroclaw-host:4000/v1",
+    "model": "fast",
+    "timeout_s": 8,
+    "max_calls": 5,
+    "key_file": "~/.claude/signal-bar.key"
+  }
+}

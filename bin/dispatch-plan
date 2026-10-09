@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""Deterministic DAG runner for dispatch delta briefs."""
+import argparse
+import concurrent.futures
+import json
+import os
+import pathlib
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from datetime import datetime, timezone
+
+DISPATCH = '$HOME/.local/bin/dispatch'
+LINTER = '$HOME/.local/bin/brief-lint'
+SLOTS_BIN = '$HOME/.local/bin/remote-worker'
+SLOTS_MIN_INTERVAL = 10.0
+DEFAULT_RUNS = pathlib.Path('$HOME/agent-orch/plans')
+
+ACCEPTED_TOP_KEYS = ('id', 'nodes')
+ACCEPTED_NODE_KEYS = ('id', 'delta', 'repo', 'deps', 'worker', 'verify_delta', 'verify_on_pass', 'execution', 'base', 'async')
+
+class PlanError(Exception):
+    pass
+
+class UnknownKeyError(PlanError):
+    pass
+
+def utcstamp():
+    return datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+
+def read_free_slots():
+    """Free pool slots, read live: enabled and not occupied, per `remote-worker slots`.
+
+    Returns None when the probe cannot be trusted. The pool is one global budget
+    shared with every other session, so an unreadable answer must never be
+    smoothed into a guessed headroom.
+    """
+    bin_path = os.environ.get('DISPATCH_PLAN_SLOTS_BIN', SLOTS_BIN)
+    try:
+        cp = subprocess.run([bin_path, 'slots'], text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=120)
+    except Exception:
+        return None
+    if cp.returncode != 0:
+        return None
+    try:
+        obj = json.loads(cp.stdout)
+    except Exception:
+        return None
+    slots = obj.get('slots') if isinstance(obj, dict) else None
+    if not isinstance(slots, list) or not slots:
+        return None
+    return sum(1 for s in slots if isinstance(s, dict) and s.get('enabled') and not s.get('occupied'))
+
+def validate_plan(path):
+    try:
+        obj = json.loads(pathlib.Path(path).read_text())
+    except Exception as e:
+        raise PlanError(f'cannot read plan JSON: {e}')
+    if not isinstance(obj, dict) or not isinstance(obj.get('id'), str) or not isinstance(obj.get('nodes'), list):
+        raise PlanError('plan must contain string id and nodes list')
+    for key in obj:
+        if key not in ACCEPTED_TOP_KEYS:
+            raise UnknownKeyError(f'unknown plan key: {key}')
+    ids, nodes = set(), []
+    for n in obj['nodes']:
+        if not isinstance(n, dict): raise PlanError('each node must be an object')
+        for key in ('id','delta','repo','deps'):
+            if key not in n: raise PlanError(f'node missing {key}')
+        for key in n:
+            if key not in ACCEPTED_NODE_KEYS:
+                raise UnknownKeyError(f'{n["id"]}: unknown node key: {key}')
+        if not all(isinstance(n[k], str) for k in ('id','delta','repo')) or not isinstance(n['deps'], list) or not all(isinstance(d,str) for d in n['deps']):
+            raise PlanError('invalid node field types')
+        if n.get('worker') is not None and n.get('worker') not in ('claude', 'qwen', 'codex'):
+            raise PlanError(f'{n["id"]}: worker must be claude, qwen, or codex')
+        if n['id'] in ids: raise PlanError(f'duplicate node id: {n["id"]}')
+        ids.add(n['id'])
+        for k in ('delta','repo'):
+            p = pathlib.Path(n[k])
+            if not p.is_absolute() or not p.exists(): raise PlanError(f'{n["id"]}: {k} must be an existing absolute path')
+        v = n.get('verify_delta')
+        if v is not None and (not isinstance(v,str) or not pathlib.Path(v).is_absolute() or not pathlib.Path(v).is_file()):
+            raise PlanError(f'{n["id"]}: verify_delta must be null or existing absolute file')
+        vp = n.get('verify_on_pass')
+        if vp is not None and not isinstance(vp, bool):
+            raise PlanError(f'{n["id"]}: verify_on_pass must be a boolean')
+        ex = n.get('execution')
+        if ex is not None and ex not in ('local', 'remote'):
+            raise PlanError(f'{n["id"]}: execution must be local or remote')
+        bs = n.get('base')
+        if bs is not None and (not isinstance(bs, str) or not bs.strip()):
+            raise PlanError(f'{n["id"]}: base must be a non-empty string')
+        if n.get('async') is not None and not isinstance(n['async'], bool):
+            raise PlanError(f'{n["id"]}: async must be a boolean')
+        nodes.append(dict(n))
+    byid = {n['id']:n for n in nodes}
+    for n in nodes:
+        for d in n['deps']:
+            if d not in byid: raise PlanError(f'{n["id"]}: unknown dependency {d}')
+    indeg = {n['id']:len(set(n['deps'])) for n in nodes}
+    waves=[]; remaining=set(indeg)
+    while remaining:
+        wave=[n['id'] for n in nodes if n['id'] in remaining and indeg[n['id']]==0]
+        if not wave: raise PlanError('cycle detected in node dependencies')
+        waves.append(wave)
+        for x in wave:
+            remaining.remove(x)
+            for n in nodes:
+                if x in n['deps']: indeg[n['id']]-=1
+    return obj, nodes, waves
+
+def lint(paths):
+    bad=[]; output=[]
+    for p in paths:
+        cp=subprocess.run([LINTER,p],text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+        s=cp.stdout.strip()
+        if s: output.append(f'[{p}]\n{s}')
+        if cp.returncode != 0 or re.search(r'\bERROR\b',s,re.I): bad.append(p)
+    return not bad, '\n'.join(output) or 'brief-lint: no findings'
+
+def digest_result(stdout):
+    run_dir=None
+    for line in stdout.splitlines():
+        if line.startswith('RUN_DIR='): run_dir=line.split('=',1)[1].strip()
+    if not run_dir: raise PlanError('dispatch output missing RUN_DIR=')
+    p=pathlib.Path(run_dir)/'digest.md'
+    if not p.is_file(): raise PlanError(f'digest missing: {p}')
+    text=p.read_text(errors='replace')
+    vals={}
+    for key in ('STARTED','ENDED','STATUS','REASON','ANSWER','DECISION NEEDED'):
+        m=re.search(r'^'+re.escape(key)+r':\s*(.*)$',text,re.M)
+        vals[key]=m.group(1).strip() if m else ''
+    if not vals['STATUS']: raise PlanError(f'digest missing STATUS: {p}')
+    return run_dir, vals
+
+def main_run(planpath, cap, wall, retries, dry):
+    try: obj,nodes,waves=validate_plan(planpath)
+    except UnknownKeyError as e: print(f'ERROR: {e}',file=sys.stderr); return 3
+    except PlanError as e: print(f'ERROR: {e}',file=sys.stderr); return 2
+    ok, lintout=lint([x for n in nodes for x in (n['delta'],n.get('verify_delta')) if x])
+    print(lintout)
+    if not ok: print('ERROR: lint refusal',file=sys.stderr); return 2
+    if dry:
+        for i,w in enumerate(waves,1): print(f'WAVE {i}: {", ".join(w)}')
+        return 0
+    runs=pathlib.Path(os.environ.get('DISPATCH_PLAN_HOME',str(DEFAULT_RUNS)))
+    runs.mkdir(parents=True,exist_ok=True)
+    rundir=runs/(re.sub(r'[^A-Za-z0-9_.-]','_',obj['id'])+'-'+utcstamp())
+    rundir.mkdir(parents=True,exist_ok=False)
+    journal=rundir/'events.jsonl'; start=time.monotonic(); stop_reason=''; status={}; records={}
+    def event(name,node,run_dir=''):
+        with journal.open('a') as f: f.write(json.dumps({'event':name,'timestamp':datetime.now(timezone.utc).isoformat(),'node_id':node,'run_dir':run_dir})+'\n')
+    cap=max(1,min(cap,64)); dispatch=os.environ.get('DISPATCH_PLAN_DISPATCH_BIN',DISPATCH)
+    slots_cache={'at':float('-inf'),'free':None}
+    def live_free():
+        # One probe per wave, not one per loop tick: the loop spins several times a
+        # second and each probe is an ssh round trip to the pool.
+        if time.monotonic()-slots_cache['at'] < SLOTS_MIN_INTERVAL: return slots_cache['free']
+        free=read_free_slots(); slots_cache['at']=time.monotonic(); slots_cache['free']=free
+        event('slots','', '' if free is None else f'free={free}')
+        if free is None: print('PLAN_SLOTS=probe failed; no remote node launched', flush=True)
+        else: print(f'PLAN_SLOTS=free={free}', flush=True)
+        return free
+    def uses_pool(n): return n.get('execution') != 'local'
+    def invoke(n, verifier=False):
+        delta=n['verify_delta'] if verifier else n['delta']
+        worker=n.get('worker') or ('qwen' if n.get('execution')=='local' else 'claude')
+        cmd=[dispatch,worker,delta,'--repo',n['repo']]
+        if not verifier:
+            if n.get('execution')=='remote': cmd.append('--remote')
+            if n.get('execution')=='local': cmd.append('--local')
+            if n.get('verify_on_pass') is True: cmd.append('--verify-on-pass')
+            # base and async are per-node dispatch flags: forward them verbatim
+            # so one plan can submit some nodes against a branch, asynchronously.
+            if n.get('base'): cmd.extend(['--base', n['base']])
+            if n.get('async') is True: cmd.append('--async')
+        cp=subprocess.run(cmd,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+        rd,dg=digest_result(cp.stdout)
+        if cp.returncode and not dg['STATUS']: raise PlanError(f'dispatch exited {cp.returncode}')
+        return rd,dg
+    pending={n['id']:n for n in nodes}; running={}; completed=set(); executor=concurrent.futures.ThreadPoolExecutor(max_workers=cap)
+    try:
+        while pending or running:
+            if time.monotonic()-start > wall:
+                stop_reason='wall budget exceeded'; break
+            launched=False; free=None; probe_failed=False
+            # free counts the whole shared pool, so this plan's own in-flight pool
+            # jobs come off the top before any new node is allowed to start.
+            pool_used=sum(1 for _nid,_n,_v in running.values() if uses_pool(_n))
+            for nid,n in list(pending.items()):
+                if len(running)>=cap: break
+                if not all(d in completed for d in n['deps']): continue
+                if uses_pool(n):
+                    if free is None: free=live_free()
+                    if free is None: probe_failed=True; break
+                    if pool_used >= free: continue
+                    pool_used+=1
+                del pending[nid]; event('node_started',nid); f=executor.submit(invoke,n,False); running[f]=(nid,n,False)
+                launched=True
+            if probe_failed:
+                stop_reason='remote-worker slots probe failed; no remote node launched'; break
+            if not running and not launched:
+                if pending:
+                    # Every ready node is a pool node and the pool reported full:
+                    # hold them and re-read the shared capacity until the wall budget
+                    # trips. Launching a fallback here would overshoot the global pool.
+                    if free==0: time.sleep(min(SLOTS_MIN_INTERVAL,max(0.05,wall-(time.monotonic()-start)))); continue
+                    stop_reason='no schedulable nodes'; break
+                break
+            done,_=concurrent.futures.wait(running,timeout=max(0.05,min(0.25,wall-(time.monotonic()-start))),return_when=concurrent.futures.FIRST_COMPLETED)
+            for f in done:
+                nid,n,ver=running.pop(f)
+                try: rd,dg=f.result()
+                except Exception as e: stop_reason=f'{nid}: {e}'; status[nid]='BLOCKED'; records[nid]={'run_dir':'','started':'','ended':'','retries':0}; continue
+                key='verifier' if ver else 'node'
+                event(key+'_finished',nid,rd)
+                if not ver and dg['STATUS']=='BLOCKED' and dg['REASON']=='invalid_envelope' and records.get(nid,{}).get('retries',0)<retries:
+                    rec=records.setdefault(nid,{'retries':0}); rec['retries']+=1; event('retry',nid,rd); f2=executor.submit(invoke,n,False); running[f2]=(nid,n,False); continue
+                records[nid]={'run_dir':rd,'started':dg['STARTED'],'ended':dg['ENDED'],'retries':records.get(nid,{}).get('retries',0)}
+                if dg['STATUS']=='ASSUMPTION_INVALID' or dg['DECISION NEEDED'].lower() not in ('','none'):
+                    status[nid]=dg['STATUS']; stop_reason=f'{nid}: attention required'; continue
+                if dg['STATUS']!='PASS':
+                    status[nid]=dg['STATUS']; stop_reason=f'{nid}: status {dg["STATUS"]}'; continue
+                if not ver and n.get('verify_delta'):
+                    event('verifier_started',nid,rd); fv=executor.submit(invoke,n,True); running[fv]=(nid,n,True)
+                elif ver:
+                    if dg['STATUS']!='PASS' or dg['ANSWER'].startswith('FAIL'):
+                        status[nid]='FAIL'; stop_reason=f'{nid}: verifier failed'
+                    else: status[nid]='PASS'; completed.add(nid)
+                else: status[nid]='PASS'; completed.add(nid)
+            if stop_reason:
+                # Let already-running jobs finish, but do not start new nodes.
+                pending.clear()
+        if stop_reason:
+            for f in list(running):
+                try:
+                    nid,n,ver=running.pop(f); rd,dg=f.result(); records[nid]={'run_dir':rd,'started':dg['STARTED'],'ended':dg['ENDED'],'retries':records.get(nid,{}).get('retries',0)}
+                except Exception: pass
+            event('plan_stopped','', '')
+            final='STOPPED'
+        else:
+            final='COMPLETE'; event('plan_complete','', '')
+    finally: executor.shutdown(wait=True)
+    with (rundir/'summary.md').open('w') as f:
+        f.write('| id | status | run dir | STARTED | ENDED | retries |\n|---|---|---|---|---|---:|\n')
+        for n in nodes:
+            r=records.get(n['id'],{}); f.write(f"| {n['id']} | {status.get(n['id'],'NOT_STARTED')} | {r.get('run_dir','')} | {r.get('started','')} | {r.get('ended','')} | {r.get('retries',0)} |\n")
+        f.write(f'\nPlan wall time: {time.monotonic()-start:.2f}s\nPLAN_STATUS={final}'+(f' reason={stop_reason}' if stop_reason else '')+'\n')
+    print(f'SUMMARY_PATH={rundir}/summary.md'); print(f'PLAN_STATUS={final}'+(f' reason={stop_reason}' if stop_reason else ''))
+    return 3 if final=='STOPPED' else 0
+
+def selftest():
+    # Build an isolated harness; the fake records concurrency and emits digest envelopes.
+    real_plans=DEFAULT_RUNS
+    before_count=sum(1 for _ in real_plans.iterdir()) if real_plans.exists() else 0
+    with tempfile.TemporaryDirectory(prefix='dispatch-plan-selftest-') as td:
+        root=pathlib.Path(td); delta=root/'d.md'; delta.write_text('brief\n'); repo=root/'repo'; repo.mkdir()
+        os.environ['DISPATCH_PLAN_HOME']=str(root/'plans')
+        lintbin=root/'lint'; lintbin.write_text('#!/bin/sh\necho "WARN test warning"\nexit 0\n'); lintbin.chmod(0o755)
+        slotsbin=root/'slots'; slotsbin.write_text('''#!/bin/sh
+n=${FAKE_SLOTS_FREE:-5}
+printf '{"slots":['
+i=1
+while [ "$i" -le 5 ]; do
+  [ "$i" -gt 1 ] && printf ','
+  if [ "$i" -le "$n" ]; then printf '{"slot":%d,"enabled":true,"occupied":false}' "$i"; else printf '{"slot":%d,"enabled":true,"occupied":true}' "$i"; fi
+  i=$((i+1))
+done
+printf ']}'
+'''); slotsbin.chmod(0o755)
+        os.environ['DISPATCH_PLAN_SLOTS_BIN']=str(slotsbin); os.environ['FAKE_SLOTS_FREE']='5'
+        fake=root/'fake'; fake.write_text('''#!/usr/bin/env python3
+import os,sys,time,pathlib,json
+from datetime import datetime,timezone
+state=pathlib.Path(os.environ["FAKE_STATE"]); state.mkdir(exist_ok=True)
+lock=state/"lock"; count=state/"count"
+# atomic-ish counter guarded by mkdir spin
+while True:
+ try: lock.mkdir(); break
+ except FileExistsError: time.sleep(.005)
+n=int(count.read_text() if count.exists() else "0")+1; count.write_text(str(n))
+active=state/"active"; maximum=state/"maximum"
+a=int(active.read_text() if active.exists() else "0")+1; active.write_text(str(a))
+m=max(a,int(maximum.read_text() if maximum.exists() else "0")); maximum.write_text(str(m)); lock.rmdir()
+mode=os.environ.get("FAKE_MODE",""); name=pathlib.Path(sys.argv[2]).name
+with (state/"starts").open("a") as log: log.write(name+"\\n")
+with (state/"argv").open("a") as log: log.write("\\t".join(sys.argv[1:])+"\\n")
+if mode=="slow": time.sleep(.15)
+if mode=="wall": time.sleep(.4)
+status="PASS"; reason=""; answer="ok"
+if mode=="retry" and n==1: status="BLOCKED"; reason="invalid_envelope"
+if mode=="blocked": status="BLOCKED"; reason="hard"
+if mode=="verifyfail" and name.startswith("v"): status="BLOCKED"; answer="FAIL verifier"
+rd=state/f"run-{n}"; rd.mkdir(exist_ok=True)
+(rd/"digest.md").write_text(f"STARTED: s\\nENDED: e\\nSTATUS: {status}\\nREASON: {reason}\\nANSWER: {answer}\\nDECISION NEEDED: none\\n")
+while True:
+ try: lock.mkdir(); break
+ except FileExistsError: time.sleep(.005)
+active.write_text(str(max(0,int(active.read_text())-1))); lock.rmdir()
+print("RUN_DIR="+str(rd)); print("STATUS="+status)
+'''); fake.chmod(0o755)
+        os.environ['DISPATCH_PLAN_DISPATCH_BIN']=str(fake); os.environ['FAKE_STATE']=str(root/'state'); os.environ['BRIEF_LINT_BIN']=str(lintbin)
+        # Swap linter at runtime for selftest.
+        global LINTER; old=LINTER; LINTER=str(lintbin)
+        def mk(nodes,name='p'):
+            p=root/(name+'.json'); p.write_text(json.dumps({'id':name,'nodes':nodes})); return p
+        def node(i,deps=(),verify=None,d=None):
+            return {'id':i,'delta':str(d or delta),'repo':str(repo),'deps':list(deps),'verify_delta':str(verify) if verify else None}
+        cases=[]
+        # dependency ordering and cap use successful two-wave concurrent plan
+        os.environ['FAKE_MODE']='slow'; os.environ['FAKE_STATE']=str(root/'s1')
+        da=root/'a.md'; db=root/'b.md'; dc=root/'c.md'
+        for x in (da,db,dc): x.write_text('brief\\n')
+        p=mk([node('a',d=da),node('b',d=db),node('c',['a','b'],d=dc)],'dep'); t0=time.monotonic(); rc=main_run(p,2,4,2,False)
+        starts=(root/'s1'/'starts').read_text().splitlines(); peak=int((root/'s1'/'maximum').read_text()); cases.append(rc==0 and len(starts)==3 and starts.index('c.md')>max(starts.index('a.md'),starts.index('b.md')) and peak<=2 and peak==2)
+        # retry cosmetic block
+        os.environ['FAKE_MODE']='retry'; os.environ['FAKE_STATE']=str(root/'s2'); rc=main_run(mk([node('a')],'retry'),1,4,2,False); cases.append(rc==0)
+        # hard block
+        os.environ['FAKE_MODE']='blocked'; os.environ['FAKE_STATE']=str(root/'s3'); rc=main_run(mk([node('a')],'blocked'),1,4,2,False); cases.append(rc==3)
+        # verifier failure
+        vd=root/'v.md'; vd.write_text('verify\n'); os.environ['FAKE_MODE']='verifyfail'; os.environ['FAKE_STATE']=str(root/'s4'); rc=main_run(mk([node('a',verify=vd)],'vf'),1,4,2,False); cases.append(rc==3)
+        # wall budget
+        os.environ['FAKE_MODE']='wall'; os.environ['FAKE_STATE']=str(root/'s5'); rc=main_run(mk([node('a'),node('b')],'wall'),1,.05,0,False); cases.append(rc==3)
+        # lint refusal (ERROR)
+        err=root/'err.md'; err.write_text('ERROR finding\n'); el=root/'errlint'; el.write_text('#!/bin/sh\necho ERROR finding\nexit 1\n'); el.chmod(0o755); LINTER=str(el); rc=main_run(mk([node('a',d=err)],'lint'),1,1,0,False); cases.append(rc==2); LINTER=str(lintbin)
+        # cycle rejection
+        cyc=mk([node('a',['b']),node('b',['a'])],'cycle')
+        try: validate_plan(cyc); cases.append(False)
+        except PlanError: cases.append(True)
+        # unknown node key rejected before dispatch (--dry-run exits 3)
+        bad=root/'badkey.json'; bad.write_text(json.dumps({'id':'badkey','nodes':[{'id':'a','delta':str(delta),'repo':str(repo),'deps':[],'surprise':1}]})); cases.append(main_run(bad,1,1,0,True)==3)
+        # accepted keys only pass --dry-run (verify_on_pass/execution/worker supported)
+        good=root/'good.json'; good.write_text(json.dumps({'id':'good','nodes':[{'id':'a','delta':str(delta),'repo':str(repo),'deps':[],'worker':'qwen','verify_on_pass':True,'execution':'local'}]})); cases.append(main_run(good,1,1,0,True)==0)
+        # base and async reach dispatch as --base VALUE and --async
+        os.environ['FAKE_MODE']='pass'; os.environ['FAKE_STATE']=str(root/'s9')
+        ba=root/'baseasync.json'; ba.write_text(json.dumps({'id':'baseasync','nodes':[{'id':'a','delta':str(delta),'repo':str(repo),'deps':[],'base':'release','async':True}]}))
+        rc=main_run(ba,1,4,0,False); argv9=(root/'s9'/'argv').read_text()
+        cases.append(rc==0 and '--base\trelease' in argv9 and '--async' in argv9)
+        # base alone is forwarded without --async, and async false adds neither
+        os.environ['FAKE_STATE']=str(root/'s10')
+        bo=root/'baseonly.json'; bo.write_text(json.dumps({'id':'baseonly','nodes':[{'id':'a','delta':str(delta),'repo':str(repo),'deps':[],'base':'main','async':False}]}))
+        rc=main_run(bo,1,4,0,False); argv10=(root/'s10'/'argv').read_text()
+        cases.append(rc==0 and '--base\tmain' in argv10 and '--async' not in argv10)
+        # live free-slot count binds wave width below the --cap ceiling
+        os.environ['DISPATCH_PLAN_SLOTS_BIN']=str(slotsbin); os.environ['FAKE_SLOTS_FREE']='1'
+        os.environ['FAKE_MODE']='slow'; os.environ['FAKE_STATE']=str(root/'s6')
+        de=root/'e.md'; df=root/'f.md'
+        for x in (de,df): x.write_text('brief\n')
+        rc=main_run(mk([node('a',d=de),node('b',d=df)],'free1'),2,6,2,False)
+        starts6=(root/'s6'/'starts').read_text().splitlines(); peak1=int((root/'s6'/'maximum').read_text()); cases.append(rc==0 and len(starts6)==2 and peak1==1)
+        # free 0 launches nothing at all and stops on the wall budget
+        os.environ['FAKE_SLOTS_FREE']='0'; os.environ['FAKE_MODE']='slow'; os.environ['FAKE_STATE']=str(root/'s7')
+        rc=main_run(mk([node('a',d=de)],'free0'),2,0.4,2,False); cases.append(rc==3 and not (root/'s7'/'starts').exists())
+        # an unreadable slots probe launches nothing and names the reason
+        badslots=root/'slots-bad'; badslots.write_text('#!/bin/sh\nexit 1\n'); badslots.chmod(0o755)
+        os.environ['DISPATCH_PLAN_SLOTS_BIN']=str(badslots); os.environ['FAKE_MODE']='slow'; os.environ['FAKE_STATE']=str(root/'s8')
+        rc=main_run(mk([node('a',d=de)],'slotsbad'),2,6,2,False); cases.append(rc==3 and not (root/'s8'/'starts').exists())
+        LINTER=old
+        after_count=sum(1 for _ in real_plans.iterdir()) if real_plans.exists() else 0
+        cases.append(before_count==after_count)
+        print(f'SELFTEST_CASES={len(cases)} PASSED={sum(cases)} REAL_PLANS_BEFORE={before_count} REAL_PLANS_AFTER={after_count}')
+        return 0 if all(cases) and len(cases)==15 else 1
+
+def main():
+    if len(sys.argv)==2 and sys.argv[1]=='--selftest': return selftest()
+    ap=argparse.ArgumentParser(prog='dispatch-plan', description='Deterministic DAG runner for dispatch delta briefs. Accepted plan keys: ' + ', '.join(ACCEPTED_TOP_KEYS) + '. Accepted node keys: ' + ', '.join(ACCEPTED_NODE_KEYS) + '. verify_on_pass (bool) appends --verify-on-pass to the dispatch call; execution (local|remote) appends --remote when remote and --local when local; base (string) appends --base VALUE; async (bool) appends --async so the node is submitted and returns at once. --cap is a local ceiling only: pool-node waves are additionally bounded by the live free-slot count read from remote-worker slots before each wave.')
+    ap.add_argument('plan'); ap.add_argument('--cap',type=int,default=5); ap.add_argument('--max-wall-seconds',type=float,default=3600); ap.add_argument('--max-retries',type=int,default=2); ap.add_argument('--dry-run',action='store_true')
+    a=ap.parse_args()
+    if a.cap<1 or a.max_wall_seconds<=0 or a.max_retries<0: print('ERROR: invalid numeric option',file=sys.stderr); return 2
+    return main_run(a.plan,a.cap,a.max_wall_seconds,a.max_retries,a.dry_run)
+if __name__=='__main__': sys.exit(main())

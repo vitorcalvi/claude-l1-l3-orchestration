@@ -1,0 +1,595 @@
+#!/usr/bin/env python3
+"""fleet-metrics - per-task token and cost baseline, printed as TOON.
+
+One stdlib-only read-only command (python3, no third-party imports, no network)
+that joins the two halves of the l1opt cost story:
+
+    fleet-metrics [--since 7d] [--claude-dir DIR] [--zc-ledger FILE] [--top N]
+
+    L1  Claude Code transcripts under --claude-dir (~/.claude/projects).
+        Every *.jsonl record whose `message.role` (or `type`) is `assistant`
+        contributes one turn plus its `message.usage` counters:
+        input_tokens -> fresh_in, cache_read_input_tokens -> cache_read,
+        cache_creation_input_tokens -> cache_write, output_tokens -> out.
+        A streamed message is written once per content block with the same
+        message id, so records are de-duplicated by message id (falling back to
+        requestId, then the record uuid) and the largest usage seen per message
+        is kept: one assistant message is one turn, counted once.
+
+    L3  The ZeroClaw job ledger --zc-ledger ($WORK_ROOT/metrics/jobs.jsonl by
+        default), the exact record run-job.sh appends and server-bin/zc-metrics.py
+        reads: job_id, lane, model, fallback_of, start, end, latency_ms,
+        llm_calls, tool_calls, tools, tokens_in, tokens_out, cost_usd,
+        provider_failures, test_cmd_set, test_exit, status.
+
+Output is TOON: `name[N]{field,...}:` followed by N indented CSV rows, then a
+`totals[M]{metric,value}:` table covering the whole window (never the truncated
+--top view).
+
+Exit codes: 0 whenever a baseline could be produced, including when an input
+is missing. A missing or unreadable input is reported as the value `unknown`
+with an empty table, never as an error - a baseline that cannot see one half
+still answers for the other half. Only usage errors (a bad --since/--top, an
+unknown flag) exit 2, and nothing is ever written anywhere but stdout.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import re
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+# Envelope STATUS values that count as a job succeeding, same set zc-metrics.py
+# counts: run-job.sh emits DONE for a job that finished its acceptance run.
+SUCCESS_STATUSES = frozenset({"DONE"})
+
+# A lane record without a lane is reported as this, not guessed at.
+LANE_UNKNOWN = "unknown"
+
+# Printed wherever a number could not be read because an input was missing.
+UNKNOWN = "unknown"
+
+COST_PLACES = 6
+
+DEFAULT_WINDOW_HOURS = 24.0 * 7.0        # --since 7d
+DEFAULT_CLAUDE_SUBDIR = "projects"
+DEFAULT_WORK_ROOT = "/work"
+LEDGER_RELATIVE = ("metrics", "jobs.jsonl")
+
+# --since accepts 7d/24h/30m/90s/2w, a bare number of hours (what zc-metrics
+# takes) or all. The suffix is what makes this different from that tool.
+WINDOW_RE = re.compile(r"(\d+(?:\.\d+)?)\s*([smhdw]?)")
+WINDOW_UNITS = {"": 1.0, "s": 1.0 / 3600.0, "m": 1.0 / 60.0, "h": 1.0,
+                "d": 24.0, "w": 168.0}
+WINDOW_ALL = ("all", "any", "none", "forever", "max")
+
+L1_FIELDS = ("session", "turns", "fresh_in", "cache_read", "cache_write", "out")
+L3_FIELDS = ("lane", "jobs", "success", "retries", "in_tok", "out_tok",
+             "cost_usd", "p50_latency_ms")
+TOTALS_FIELDS = ("metric", "value")
+
+TOTAL_METRICS = ("l1_sessions", "l1_turns", "l1_fresh_in", "l1_cache_read",
+                 "l1_cache_write", "l1_out", "l1_tokens", "l3_lanes",
+                 "l3_jobs", "l3_success", "l3_retries", "l3_in_tok",
+                 "l3_out_tok", "l3_tokens", "l3_cost_usd",
+                 "l3_p50_latency_ms")
+
+# TOON values carrying one of these (or leading/trailing space) are quoted.
+TOON_QUOTE_RE = re.compile(r'[,:\[\]{}"]|^\s|\s$')
+
+
+# --------------------------------------------------------------------------
+# formatting helpers
+# --------------------------------------------------------------------------
+
+def _as_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    return out if math.isfinite(out) else default
+
+
+def _as_str(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    return "" if value is None else str(value)
+
+
+def _fmt_cost(value: float) -> str:
+    """Cost with the float noise gone: 0.002, and 0.0 prints as 0."""
+    rounded = round(float(value), COST_PLACES)
+    if rounded == int(rounded):
+        return str(int(rounded))
+    return f"{rounded:.{COST_PLACES}f}".rstrip("0").rstrip(".")
+
+
+def percentile(values: Sequence[float], pct: float) -> float:
+    """Nearest-rank percentile, so every reported value is an observed sample
+    (the same rule zc-metrics.py uses, kept so the two agree)."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    rank = max(1, math.ceil(pct / 100.0 * len(ordered)))
+    return float(ordered[min(rank, len(ordered)) - 1])
+
+
+# --------------------------------------------------------------------------
+# arguments
+# --------------------------------------------------------------------------
+
+def parse_window(text: str) -> Optional[float]:
+    """`--since` as a number of hours, or None for no window at all.
+
+    Accepts a bare number (hours, matching zc-metrics.py --since), a suffix
+    from 7d/24h/30m/90s/2w, or all/any/none/0 for the whole file.
+    """
+    raw = _as_str(text).strip().lower()
+    if raw in WINDOW_ALL:
+        return None
+    match = WINDOW_RE.fullmatch(raw)
+    if not match:
+        raise ValueError(
+            f"cannot read --since {text!r}: use 7d, 24h, 30m, a number of "
+            f"hours, or all")
+    hours = float(match.group(1)) * WINDOW_UNITS[match.group(2)]
+    return None if hours <= 0 else hours
+
+
+def format_window(hours: Optional[float]) -> str:
+    return "all" if hours is None else f"{hours:g}h"
+
+
+def default_claude_dir() -> str:
+    """Claude Code keeps transcripts in <config>/projects; CLAUDE_CONFIG_DIR
+    moves the config dir, which is how a sandboxed run relocates them."""
+    config = os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude"
+    return os.path.join(os.path.expanduser(config), DEFAULT_CLAUDE_SUBDIR)
+
+
+def default_ledger() -> str:
+    """run-job.sh appends to $ZC_METRICS_FILE, defaulting to
+    $WORK_ROOT/metrics/jobs.jsonl under /work."""
+    explicit = _as_str(os.environ.get("ZC_METRICS_FILE")).strip()
+    if explicit:
+        return os.path.expanduser(explicit)
+    root = os.path.expanduser(
+        _as_str(os.environ.get("WORK_ROOT")).strip() or DEFAULT_WORK_ROOT)
+    return os.path.join(root, *LEDGER_RELATIVE)
+
+
+# --------------------------------------------------------------------------
+# reading
+# --------------------------------------------------------------------------
+
+def parse_timestamp(value: Any) -> Optional[float]:
+    """Epoch seconds from a transcript timestamp, or None when unusable.
+
+    Accepts ISO-8601 (Claude Code writes 2026-10-08T09:01:59.123Z) and a bare
+    epoch number. Naive timestamps are read as UTC.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        stamp = float(value)
+        return stamp if math.isfinite(stamp) else None
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        stamp = float(text)
+    except ValueError:
+        pass
+    else:
+        return stamp if math.isfinite(stamp) else None
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.timestamp()
+
+
+def read_jsonl(path: Path) -> List[Dict[str, Any]]:
+    """Every parseable object in a jsonl file.
+
+    A torn or hand-edited line is skipped, never fatal: this tool reports on
+    the fleet, it does not gate it.
+    """
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        return []
+    out: List[Dict[str, Any]] = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            record = json.loads(stripped)
+        except ValueError:
+            continue
+        if isinstance(record, dict):
+            out.append(record)
+    return out
+
+
+def iter_transcripts(root: Path) -> List[Path]:
+    """Transcript files under a Claude projects dir.
+
+    Transcripts live one level down, in <project>/<session-uuid>.jsonl; a dir
+    of jsonl files works too, so a fixture can be either shape.
+    """
+    try:
+        entries = sorted(root.iterdir())
+    except OSError:
+        return []
+    found: List[Path] = []
+    for entry in entries:
+        try:
+            if entry.is_dir():
+                found.extend(sorted(p for p in entry.glob("*.jsonl")
+                                    if p.is_file()))
+            elif entry.is_file() and entry.name.endswith(".jsonl"):
+                found.append(entry)
+        except OSError:
+            continue
+    return found
+
+
+def usage_tokens(usage: Any) -> Tuple[int, int, int, int]:
+    """(fresh_in, cache_read, cache_write, out) from a message.usage object.
+
+    cache_creation_input_tokens is the flat field; the nested cache_creation
+    breakdown (ephemeral_5m/1h input tokens) is summed when the flat one is
+    absent, so both spellings of the same counter are read.
+    """
+    if not isinstance(usage, dict):
+        return (0, 0, 0, 0)
+    fresh_in = _as_int(usage.get("input_tokens"))
+    cache_read = _as_int(usage.get("cache_read_input_tokens"))
+    cache_write = _as_int(usage.get("cache_creation_input_tokens"))
+    if not cache_write:
+        nested = usage.get("cache_creation")
+        if isinstance(nested, dict):
+            cache_write = sum(_as_int(v) for v in nested.values())
+    return (fresh_in, cache_read, cache_write,
+            _as_int(usage.get("output_tokens")))
+
+
+def _elementwise_max(left: Tuple[int, ...], right: Tuple[int, ...]) -> Tuple[int, ...]:
+    return tuple(max(a, b) for a, b in zip(left, right))
+
+
+def read_session(path: Path, cutoff: Optional[float]) -> Optional[Dict[str, Any]]:
+    """Turn and token counters for one transcript, or None when it has no
+    assistant turn inside the window.
+
+    Records with no usable timestamp are kept rather than dropped: shrinking
+    the window to whatever happens to be parseable would understate the fleet.
+    """
+    best: Dict[str, Tuple[int, int, int, int]] = {}
+    for index, record in enumerate(read_jsonl(path)):
+        message = record.get("message")
+        if not isinstance(message, dict):
+            continue
+        role = _as_str(message.get("role")).strip().lower()
+        kind = _as_str(record.get("type")).strip().lower()
+        if role != "assistant" and kind != "assistant":
+            continue
+        stamp = parse_timestamp(record.get("timestamp"))
+        if cutoff is not None and stamp is not None and stamp < cutoff:
+            continue
+        key = (_as_str(message.get("id")).strip()
+               or _as_str(record.get("requestId")).strip()
+               or _as_str(record.get("uuid")).strip()
+               or f"line:{index}")
+        tokens = usage_tokens(message.get("usage"))
+        seen = best.get(key)
+        best[key] = tokens if seen is None else _elementwise_max(seen, tokens)
+
+    if not best:
+        return None
+    totals = [0, 0, 0, 0]
+    for tokens in best.values():
+        for index, value in enumerate(tokens):
+            totals[index] += value
+    return {
+        "session": path.stem,
+        "turns": len(best),
+        "fresh_in": totals[0],
+        "cache_read": totals[1],
+        "cache_write": totals[2],
+        "out": totals[3],
+    }
+
+
+def build_l1(claude_dir: Path, cutoff: Optional[float]) -> Dict[str, Any]:
+    """Per-session L1 rows. `known` is False when the dir itself could not be
+    read, which is the only L1 condition the caller reports as unknown."""
+    if not claude_dir.is_dir():
+        return {"known": False, "reason": "not a directory", "rows": []}
+
+    by_session: Dict[str, Dict[str, Any]] = {}
+    for path in iter_transcripts(claude_dir):
+        row = read_session(path, cutoff)
+        if row is None:
+            continue
+        # Session ids are uuid file stems and so globally unique; a collision
+        # (two projects, same stem) merges rather than losing a row.
+        existing = by_session.get(row["session"])
+        if existing is None:
+            by_session[row["session"]] = row
+            continue
+        existing["turns"] += row["turns"]
+        for field in ("fresh_in", "cache_read", "cache_write", "out"):
+            existing[field] += row[field]
+
+    rows = list(by_session.values())
+    # Heaviest sessions first, ties by session id, so the head of the table is
+    # the interesting part of a baseline.
+    rows.sort(key=lambda r: (-(r["fresh_in"] + r["cache_read"]
+                               + r["cache_write"] + r["out"]), r["session"]))
+    return {"known": True, "reason": "", "rows": rows}
+
+
+def _blank_lane() -> Dict[str, Any]:
+    return {"jobs": 0, "success": 0, "retries": 0, "in_tok": 0, "out_tok": 0,
+            "cost_usd": 0.0, "latencies": []}
+
+
+def build_l3(ledger: Path, cutoff: Optional[float]) -> Dict[str, Any]:
+    """Per-lane L3 rows from the run-job.sh ledger zc-metrics.py reads.
+
+    A record counts as a retry when it names a fallback_of: a `-fb<n>` hop of an
+    earlier attempt, which is the same counter zc-metrics reports as fallbacks,
+    so the two tools can be diffed against each other.
+    """
+    if not ledger.is_file():
+        return {"known": False, "reason": "not a file", "rows": [],
+                "latencies": []}
+
+    records = read_jsonl(ledger)
+    windowed: List[Dict[str, Any]] = []
+    for record in records:
+        stamp = record.get("end", record.get("start"))
+        try:
+            end = float(stamp)
+        except (TypeError, ValueError):
+            # No usable timestamp: keep the record rather than silently
+            # shrinking the window (same rule as zc-metrics.py).
+            windowed.append(record)
+            continue
+        if cutoff is None or end >= cutoff:
+            windowed.append(record)
+
+    lanes: Dict[str, Dict[str, Any]] = {}
+    for record in windowed:
+        lane = _as_str(record.get("lane")).strip() or LANE_UNKNOWN
+        entry = lanes.setdefault(lane, _blank_lane())
+        entry["jobs"] += 1
+        if _as_str(record.get("status")).strip().upper() in SUCCESS_STATUSES:
+            entry["success"] += 1
+        if _as_str(record.get("fallback_of")).strip():
+            entry["retries"] += 1
+        if record.get("latency_ms") is not None:
+            entry["latencies"].append(_as_float(record.get("latency_ms")))
+        entry["in_tok"] += _as_int(record.get("tokens_in"))
+        entry["out_tok"] += _as_int(record.get("tokens_out"))
+        entry["cost_usd"] += _as_float(record.get("cost_usd"))
+
+    rows: List[Dict[str, Any]] = []
+    for lane in sorted(lanes):
+        entry = lanes[lane]
+        rows.append({
+            "lane": lane,
+            "jobs": entry["jobs"],
+            "success": entry["success"],
+            "retries": entry["retries"],
+            "in_tok": entry["in_tok"],
+            "out_tok": entry["out_tok"],
+            "cost_usd": round(entry["cost_usd"], COST_PLACES),
+            "p50_latency_ms": int(percentile(entry["latencies"], 50)),
+        })
+    # Every latency sample in the window, for the fleet-wide p50 below.
+    latencies: List[float] = []
+    for entry in lanes.values():
+        latencies.extend(entry["latencies"])
+    return {"known": True, "reason": "", "rows": rows, "latencies": latencies}
+
+
+# --------------------------------------------------------------------------
+# totals
+# --------------------------------------------------------------------------
+
+def l1_totals(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    totals = {"l1_sessions": len(rows), "l1_turns": 0, "l1_fresh_in": 0,
+              "l1_cache_read": 0, "l1_cache_write": 0, "l1_out": 0}
+    for row in rows:
+        totals["l1_turns"] += row["turns"]
+        for field in ("fresh_in", "cache_read", "cache_write", "out"):
+            totals["l1_" + field] += row[field]
+    totals["l1_tokens"] = (totals["l1_fresh_in"] + totals["l1_cache_read"]
+                           + totals["l1_cache_write"] + totals["l1_out"])
+    return totals
+
+
+def l3_totals(rows: List[Dict[str, Any]],
+              latencies: Sequence[float]) -> Dict[str, Any]:
+    """Fleet-wide L3 totals. The p50 is taken over every observed latency
+    sample, not over the per-lane p50s, which would be a different number."""
+    totals: Dict[str, Any] = {"l3_lanes": len(rows), "l3_jobs": 0,
+                              "l3_success": 0, "l3_retries": 0, "l3_in_tok": 0,
+                              "l3_out_tok": 0, "l3_cost_usd": 0.0}
+    for row in rows:
+        totals["l3_jobs"] += row["jobs"]
+        totals["l3_success"] += row["success"]
+        totals["l3_retries"] += row["retries"]
+        totals["l3_in_tok"] += row["in_tok"]
+        totals["l3_out_tok"] += row["out_tok"]
+        totals["l3_cost_usd"] += row["cost_usd"]
+    totals["l3_tokens"] = totals["l3_in_tok"] + totals["l3_out_tok"]
+    totals["l3_cost_usd"] = round(totals["l3_cost_usd"], COST_PLACES)
+    totals["l3_p50_latency_ms"] = int(percentile(latencies, 50))
+    return totals
+
+
+def build_totals(l1: Dict[str, Any], l3: Dict[str, Any]) -> List[Tuple[str, Any]]:
+    """metric -> value rows. An input that could not be read leaves its own
+    metrics `unknown` and leaves the other half's numbers intact."""
+    known = {}
+    if l1["known"]:
+        known.update(l1_totals(l1["rows"]))
+    if l3["known"]:
+        known.update(l3_totals(l3["rows"], l3["latencies"]))
+    return [(metric, known.get(metric, UNKNOWN)) for metric in TOTAL_METRICS]
+
+
+# --------------------------------------------------------------------------
+# TOON rendering
+# --------------------------------------------------------------------------
+
+def toon_value(value: Any) -> str:
+    # Floats are cost: print them the way zc-metrics.py does (0.05, not
+    # 0.05000000000000001 and not a bare 0.0 for a zero cost).
+    if isinstance(value, float):
+        return _fmt_cost(value) if math.isfinite(value) else UNKNOWN
+    text = UNKNOWN if value is None else str(value)
+    if text == "" or TOON_QUOTE_RE.search(text):
+        text = '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return text
+
+
+def toon_table(name: str, fields: Sequence[str],
+               rows: Iterable[Dict[str, Any]]) -> List[str]:
+    body = list(rows)
+    lines = ["%s[%d]{%s}:" % (name, len(body), ",".join(fields))]
+    for row in body:
+        lines.append("  " + ",".join(toon_value(row.get(f)) for f in fields))
+    return lines
+
+
+def render(l1: Dict[str, Any], l3: Dict[str, Any], totals: List[Tuple[str, Any]],
+           window: Optional[float], claude_dir: Path, ledger: Path,
+           top: int) -> str:
+    lines: List[str] = []
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    lines.append("# fleet-metrics baseline window=%s generated=%s"
+                 % (format_window(window), stamp))
+    lines.append("# l1_source=%s (%s)" % (claude_dir,
+                                          "ok" if l1["known"] else
+                                          "unknown: " + l1["reason"]))
+    lines.append("# l3_source=%s (%s)" % (ledger,
+                                          "ok" if l3["known"] else
+                                          "unknown: " + l3["reason"]))
+
+    l1_rows = l1["rows"]
+    if top > 0 and len(l1_rows) > top:
+        lines.append("# l1_sessions shown=%d of %d (largest first; "
+                     "totals cover the whole window)" % (top, len(l1_rows)))
+        l1_rows = l1_rows[:top]
+    lines.extend(toon_table("l1_sessions", L1_FIELDS, l1_rows))
+    lines.extend(toon_table("l3_lanes", L3_FIELDS, l3["rows"]))
+    lines.append("%s[%d]{%s}:" % ("totals", len(totals), ",".join(TOTALS_FIELDS)))
+    for metric, value in totals:
+        lines.append("  %s,%s" % (toon_value(metric), toon_value(value)))
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# cli
+# --------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="fleet-metrics",
+        description="Per-task token and cost baseline in TOON: L1 Claude Code "
+                    "sessions (fresh/cache/output tokens, turns) and L3 "
+                    "ZeroClaw lanes (jobs, retries, cost, p50 latency).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=("examples:\n"
+                "  fleet-metrics --since 7d\n"
+                "  fleet-metrics --since 24h --top 20\n"
+                "  fleet-metrics --claude-dir ./claude-projects "
+                "--zc-ledger ./metrics/jobs.jsonl\n"
+                "\n"
+                "A missing --claude-dir or --zc-ledger is reported as "
+                "`unknown` in the totals with an empty table; the exit code "
+                "is still 0.\n"),
+    )
+    parser.add_argument("--since", default="7d", metavar="WINDOW",
+                        help="window to cover: 7d, 24h, 30m, a bare number of "
+                             "hours, or all (default: 7d)")
+    parser.add_argument("--claude-dir", default=None, metavar="DIR",
+                        help="Claude Code projects dir holding the "
+                             "<session>.jsonl transcripts "
+                             "(default: $CLAUDE_CONFIG_DIR/projects, else "
+                             "~/.claude/projects)")
+    parser.add_argument("--zc-ledger", default=None, metavar="FILE",
+                        help="ZeroClaw job ledger "
+                             "(default: $ZC_METRICS_FILE, else "
+                             "$WORK_ROOT/metrics/jobs.jsonl, else "
+                             "/work/metrics/jobs.jsonl)")
+    parser.add_argument("--top", type=int, default=0, metavar="N",
+                        help="show only the N heaviest L1 sessions "
+                             "(0 = all); totals always cover the whole window")
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        window = parse_window(args.since)
+    except ValueError as exc:
+        print("fleet-metrics: %s" % exc, file=sys.stderr)
+        return 2
+    if args.top < 0:
+        print("fleet-metrics: --top takes a count of sessions (0 = all)",
+              file=sys.stderr)
+        return 2
+
+    claude_dir = Path(os.path.expanduser(
+        args.claude_dir if args.claude_dir is not None else default_claude_dir()))
+    ledger = Path(os.path.expanduser(
+        args.zc_ledger if args.zc_ledger is not None else default_ledger()))
+    cutoff = None if window is None else time.time() - window * 3600.0
+
+    # Neither half can fail the command: a broken source is `unknown`, not an
+    # error, because a baseline is an answer to a question, not a gate.
+    l1 = build_l1(claude_dir, cutoff)
+    l3 = build_l3(ledger, cutoff)
+    print(render(l1, l3, build_totals(l1, l3), window, claude_dir, ledger,
+                 args.top))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except BrokenPipeError:                       # e.g. `| head`
+        try:
+            sys.stdout.close()
+        finally:
+            raise SystemExit(0)
+    except KeyboardInterrupt:
+        raise SystemExit(130)

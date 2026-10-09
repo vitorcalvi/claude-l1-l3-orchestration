@@ -1,0 +1,1396 @@
+#!/usr/bin/env bash
+# remote-worker (rq-new) — Mac-side dispatcher for the RQ-backed Tier-3
+# runner.  This is the staged replacement for the live remote-worker.
+# It talks to the staged `remote-dispatch.py.rq-new` on zeroclaw-host
+# over SSH and adds:
+#   * `submit --priority high|normal|low` (default normal)
+#   * capacity guard derived from dispatcher list_jobs summary + slots
+#     (hard cap 5, "never more than 5 pool jobs in flight
+#      (running+queued)" -- same rule as the live wrapper)
+#   * exit codes: 0 ok, 1 dispatcher ok:false, 2 transport/validation,
+#     64 usage, 75 capacity exceeded
+# All other verbs match the live wrapper exactly so existing callers
+# (e.g. harness/cutover.sh from W3) keep working.
+#
+# The dispatch-ssh-entry.sh SSH adapter is unchanged: it pipes the
+# payload on stdin and prints the response on stdout.
+#
+# Lane C added the L1 read path on top, without touching any older verb:
+# `wait` (block until terminal, exit 0 SUCCESS / 2 PARTIAL_OK / 1 other),
+# `digest` (at most 8 TOON lines) and `fetch` (one artifact from the job
+# branch). See the "wait / digest / fetch" section below.
+#
+# Constraints (unchanged from live):
+#   - No secrets are ever read, logged, or written.
+#   - All paths/args match the live wrapper's interface exactly.
+#   - NEVER push --force / --force-with-lease to worker-remote.
+main() {
+set -euo pipefail
+
+readonly SSH_HOST="zeroclaw-host"
+readonly DISPATCH_HOST="dispatch-host"
+readonly CONTAINER="agent-runner"
+readonly REMOTE_HOME='~/agent-work'
+readonly REMOTE_REPO_DIR="${REMOTE_HOME}/repos"
+readonly REMOTE_BRIEFS_DIR="${REMOTE_HOME}/briefs"
+readonly REMOTE_LOG_DIR="${REMOTE_HOME}/logs"
+readonly REMOTE_WORKTREES_DIR="${REMOTE_HOME}/worktrees"
+readonly REMOTE_JOBS_DIR="${REMOTE_HOME}/jobs"
+readonly REMOTE_SLOTS_DIR="${REMOTE_HOME}/slots"
+
+# Strict validation patterns matching the new dispatcher.
+readonly RW_REPO_RE='^[A-Za-z0-9._-]+$'
+readonly RW_JOBID_RE='^[A-Za-z0-9._-]+$'
+readonly RW_BRANCH_RE='^[A-Za-z0-9._/.-]+$'
+readonly RW_WORKER_RE='^(qwen|claude)$'
+readonly RW_MODE_RE='^(--editable|--read-only)$'
+readonly RW_PRIORITY_RE='^(high|normal|low)$'
+# NOTE: 'claude' is still an accepted worker kind for --worker argument
+# validation, but rq-worker-claude-1 was retired on 2026-10-06 and the
+# claude kind no longer gets a per-kind capacity budget (see
+# DEFAULT_KIND_CAP in _capacity_from_dispatcher).
+# Hard capacity (matches rq-ctl.py workers --capacity, which reads
+# RUNNER_MAX_CONCURRENT from the pool, and the live wrapper's
+# "never more than N pool jobs in flight" rule).
+readonly RW_HARD_MAX_CAPACITY=5
+# Soft cap: refuse to enqueue when the running count is already at
+# capacity and there are >= this many queued (queue depth policy).
+readonly RW_QUEUED_GUARD=3
+# `submit --wait`: when the pool is over its cap, poll every 30s for up
+# to 30 minutes instead of refusing outright.  Opt-in only; without the
+# flag submit keeps its historical refuse-on-full behaviour.
+readonly RW_WAIT_POLL_SECONDS=30
+readonly RW_WAIT_TIMEOUT_MINUTES=30
+
+# ---------------------------------------------------------------------------
+# SSH dispatch helper
+# ---------------------------------------------------------------------------
+
+# Send a JSON request to the dispatcher; print the response verbatim.
+# Returns 0 if ok:true, 1 if ok:false, 2 if transport/parse failure.
+_dispatch_call() {
+  local payload="$1"
+  local raw
+  if ! raw="$(printf '%s' "$payload" | ssh -T -o batchmode=yes -o connecttimeout=10 -o serveraliveinterval=30 -o serveralivecountmax=3 "${DISPATCH_HOST}" 2>/dev/null)"; then
+    echo "remote-worker: ssh transport to ${DISPATCH_HOST} failed" >&2
+    return 2
+  fi
+  if [[ -z "$raw" ]]; then
+    echo "remote-worker: empty response from ${DISPATCH_HOST}" >&2
+    return 2
+  fi
+  if ! printf '%s' "$raw" | python3 -c 'import sys,json; json.loads(sys.stdin.read())' 2>/dev/null; then
+    echo "remote-worker: non-JSON response from ${DISPATCH_HOST}" >&2
+    echo "remote-worker: raw response: $raw" >&2
+    return 2
+  fi
+  printf '%s' "$raw"
+  if printf '%s' "$raw" | python3 -c 'import sys,json; sys.exit(0 if json.loads(sys.stdin.read()).get("ok") else 1)' 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
+
+# ---------------------------------------------------------------------------
+# Request payloads
+# ---------------------------------------------------------------------------
+#
+# macOS still ships /bin/bash 3.2, and 3.2 drops the braces of a Python dict
+# literal when the call sits inside "$(...)": the status request used to reach
+# python3 with its braces already eaten and died with a SyntaxError on the
+# Mac, while the very same line ran fine under bash 5 on Linux.  Every request
+# this tool sends is therefore shaped here, in ONE single-quoted variable (a
+# single-quoted string is never brace expanded), with every value handed in as
+# argv and every dict built with a dict() call -- never with a brace literal.
+#
+# Nothing in this file may reach for a bash 4 feature either: no associative
+# arrays, no bash-4 line readers, no case-folding parameter expansions.  The
+# Mac /bin/bash is the shell this tool actually runs in, so a construct only
+# the Linux CI box accepts is a construct that breaks the Mac.
+readonly RW_PAYLOAD_PY='
+import json, sys
+
+argv = sys.argv[1:]
+if not argv:
+    sys.stderr.write("remote-worker: payload needs an action\n")
+    sys.exit(2)
+payload = dict(action=argv[0])
+kind = "value"
+for field in argv[1:]:
+    if field == "--file" or field == "--int":
+        kind = field[2:]
+        continue
+    key, sep, value = field.partition("=")
+    if not sep:
+        sys.stderr.write("remote-worker: payload field is not key=value: %s\n" % field)
+        sys.exit(2)
+    if kind == "file":
+        try:
+            with open(value, "r", encoding="utf-8") as handle:
+                value = handle.read()
+        except (OSError, UnicodeDecodeError) as exc:
+            sys.stderr.write("remote-worker: cannot read %s: %s\n" % (value, exc))
+            sys.exit(2)
+    elif kind == "int":
+        try:
+            value = int(value)
+        except ValueError:
+            sys.stderr.write("remote-worker: payload field %s is not a number\n" % key)
+            sys.exit(2)
+    kind = "value"
+    payload[key] = value
+print(json.dumps(payload))
+'
+
+# _rw_payload ACTION [KEY=VALUE ...] [--file KEY=PATH] [--int KEY=NUMBER]
+#
+# Print one dispatcher request as a single line of JSON.  Values are argv,
+# never spliced into the program text; --file reads a field (a whole brief)
+# straight from disk and --int keeps a numeric field a JSON number, so every
+# verb sends byte for byte what it sent before this helper existed.
+_rw_payload() {
+  python3 -c "$RW_PAYLOAD_PY" "$@"
+}
+
+
+# ---------------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------------
+
+usage() {
+  cat <<'USAGE'
+Usage: remote-worker <command> [args...]
+
+Commands:
+  init <repo-path>
+      Provision the bare repo on zeroclaw-host and ensure the `worker-remote`
+      git remote is configured on <repo-path>.
+
+  run [--read-only] <repo-path> <base-branch> <qwen> <brief-file> [test-cmd]
+      Dispatch a job to zeroclaw-host. --read-only marks no-change
+      success as DONE and any worker commit as BLOCKED.  Prints the
+      10-line envelope; exit 0 only for DONE.
+
+  logs <job-id>
+      Tail the remote log via dispatcher log_tail.
+
+  status [job-id]
+      Without args: legacy behaviour (container status + slot dir
+      listing via SSH).  With a job-id: dispatcher status for that job.
+
+  health
+      Dispatcher health (container, dirs, RQ helpers, Redis).
+
+  slots
+      Dispatcher slots (RQ workers + legacy flock layout).
+
+  list-jobs
+      Dispatcher list_jobs (active jobs always present; history
+      newest-first; summary with active/queued/running/total counts).
+
+  result <job-id>
+      Dispatcher result envelope + 80-line log tail.
+
+  diff --repo NAME --base BRANCH [--branch TARGET]
+      List agent/* branches in the bare repo, or show a diff of one
+      branch against <base>.
+
+  cancel <job-id>
+      rq-ctl.py cancel (queued removed; running process group killed).
+
+  wait <job-id> [--timeout S] [--poll S]
+      Block until the job is terminal, print its digest and exit 0 for
+      SUCCESS, 2 for PARTIAL_OK, 1 otherwise (failed, blocked, cancelled,
+      unknown job, or timed out after --timeout seconds; default 1800,
+      polled every --poll seconds, default 5).
+
+  digest <job-id>
+      At most 8 TOON lines for the job: verdict, verdicts, tests, cost,
+      artifacts, warnings, next_action. Secrets are masked.
+
+  fetch <job-id> <path> [-o OUT]
+      The exact bytes of one file from the job branch, base64 inside the
+      dispatcher response. Without -o the bytes are written to stdout.
+
+  submit --repo NAME --base BRANCH --brief-file PATH
+         [--worker qwen|claude]
+         (--editable|--read-only)
+         [--test-cmd CMD] [--non-code]
+         [--priority high|normal|low]   (default: normal)
+         [--wait]
+      Enqueue a job via the RQ-backed dispatcher.  Capacity is counted
+      per worker kind: jobs against the live RQ workers serving that worker kind; the
+      overall hard cap of 5 is still enforced.  Refuses with
+      exit 75 when the pool is over its cap.  With --wait, an over-cap
+      pool is polled every 30 seconds
+      for up to 30 minutes and the job is enqueued once a slot frees,
+      instead of being refused.
+
+  gc [--days N] [--dry-run]
+      Unchanged from the live wrapper.  Garbage-collect stale state on
+      zeroclaw-host; --days default 3.
+
+  -h, --help
+      Show this help and exit.
+
+Exit codes:
+  0  ok (dispatcher ok:true); for `wait`, the verdict is SUCCESS
+  1  dispatcher ok:false (e.g. unknown job); for `wait`, any verdict that
+     is neither SUCCESS nor PARTIAL_OK, and a timeout
+  2  transport / parse / validation failure; for `wait` alone, PARTIAL_OK
+  64  usage error
+  75  capacity exceeded (submit refused)
+USAGE
+}
+
+
+# ---------------------------------------------------------------------------
+# git helpers (unchanged from live)
+# ---------------------------------------------------------------------------
+
+repo_common_dir_from_path() {
+  git -C "$1" rev-parse --path-format=absolute --git-common-dir
+}
+
+repo_name_from_path() {
+  local common_dir
+  common_dir="$(repo_common_dir_from_path "$1")"
+  basename "$(dirname "$common_dir")"
+}
+
+ensure_bare_repo() {
+  local repo="$1"
+  if ! ssh "${SSH_HOST}" "test -d ${REMOTE_REPO_DIR}/${repo}.git"; then
+    cmd_init "$2" >&2
+  fi
+}
+
+
+# ---------------------------------------------------------------------------
+# Base-branch sync with worker-remote (unchanged from live wrapper)
+# ---------------------------------------------------------------------------
+
+_sync_requested_base() {
+  local common_dir="$1" base_branch="$2" local_sha short_sha target_ref remote_sha
+  local_sha="$(git -C "$common_dir" rev-parse --verify "refs/heads/${base_branch}")" || return 1
+  short_sha="$(git -C "$common_dir" rev-parse --short=7 "$local_sha")" || return 1
+  target_ref="$base_branch"
+
+  ensure_bare_repo "$(repo_name_from_path "$common_dir")" "$common_dir"
+  git -C "$common_dir" fetch worker-remote "$base_branch" >/dev/null 2>&1 || true
+  remote_sha="$(git -C "$common_dir" rev-parse --verify "refs/remotes/worker-remote/${base_branch}" 2>/dev/null || true)"
+
+  if [[ -z "$remote_sha" ]] || git -C "$common_dir" merge-base --is-ancestor "$remote_sha" "$local_sha" >/dev/null 2>&1; then
+    if ! git -C "$common_dir" push worker-remote "${local_sha}:refs/heads/${base_branch}" >&2; then
+      target_ref="rw/${base_branch}-${short_sha}"
+    fi
+  elif [[ "$remote_sha" != "$local_sha" ]]; then
+    target_ref="rw/${base_branch}-${short_sha}"
+  fi
+
+  if [[ "$target_ref" != "$base_branch" ]]; then
+    git -C "$common_dir" push worker-remote "${local_sha}:refs/heads/${target_ref}" >&2 || return 1
+  fi
+
+  remote_sha="$(git -C "$common_dir" ls-remote --heads worker-remote "refs/heads/${target_ref}" | awk 'NR==1 {print $1}')"
+  if [[ "$remote_sha" != "$local_sha" ]]; then
+    echo "run: bare base ${target_ref} SHA mismatch (expected ${local_sha}, found ${remote_sha:-missing})" >&2
+    return 1
+  fi
+  printf '%s\n' "$target_ref"
+}
+
+
+# ---------------------------------------------------------------------------
+# init
+# ---------------------------------------------------------------------------
+
+cmd_init() {
+  if [[ $# -ne 1 ]]; then
+    echo "init: expected exactly 1 argument (<repo-path>); got $#" >&2
+    return 2
+  fi
+  local repo_path="$1"
+  if [[ ! -d "$repo_path" ]]; then
+    echo "init: repo-path does not exist or is not a directory: $repo_path" >&2
+    return 2
+  fi
+  local common_dir repo
+  common_dir="$(repo_common_dir_from_path "$repo_path")"
+  repo="$(repo_name_from_path "$repo_path")"
+
+  ssh "${SSH_HOST}" "mkdir -p ${REMOTE_REPO_DIR} && [ -d ${REMOTE_REPO_DIR}/${repo}.git ] || git init --bare ${REMOTE_REPO_DIR}/${repo}.git"
+
+  local remote_url="ssh://worker@zeroclaw-host/home/worker/agent-work/repos/${repo}.git"
+  local existing_url=""
+  if git -C "$common_dir" remote get-url worker-remote >/dev/null 2>&1; then
+    existing_url="$(git -C "$common_dir" remote get-url worker-remote)"
+    if [[ "$existing_url" != "$remote_url" ]]; then
+      echo "init: refusing: existing worker-remote URL does not match managed runner repo" >&2
+      return 2
+    fi
+    echo "init: remote worker-remote already present"
+  else
+    git -C "$common_dir" remote add worker-remote "$remote_url"
+    echo "init: added remote worker-remote"
+  fi
+
+  local branch=""
+  branch="$(git -C "$common_dir" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+  if git -C "$common_dir" rev-parse --verify HEAD >/dev/null 2>&1 && [[ -n "$branch" ]]; then
+    if ! git -C "$common_dir" push worker-remote "HEAD:refs/heads/${branch}" >/dev/null; then
+      echo "init: failed to seed base branch '$branch' without force" >&2
+      return 1
+    fi
+    echo "init: seeded base branch '$branch'"
+  fi
+
+  echo "init: repo=$repo bare=${REMOTE_REPO_DIR}/${repo}.git"
+}
+
+
+# ---------------------------------------------------------------------------
+# run  (live behaviour preserved)
+# ---------------------------------------------------------------------------
+
+# Generate job-id in the same <UTC yyyymmdd-HHMMSS>-<4 random hex> shape.
+new_job_id() {
+  local now rand
+  now="$(date -u +%Y%m%d-%H%M%S)"
+  rand="$(od -An -tx1 -N2 /dev/urandom | tr -d ' \n' | head -c 4)"
+  printf '%s-%s\n' "$now" "$rand"
+}
+
+cmd_run() {
+  local read_only=0
+  if [[ "${1-}" == "--read-only" ]]; then
+    read_only=1
+    shift
+  fi
+  if [[ $# -lt 4 || $# -gt 5 ]]; then
+    echo "run: expected [--read-only] plus 4 or 5 arguments; got $#" >&2
+    return 2
+  fi
+
+  local repo_path="$1"
+  local base_branch="$2"
+  local worker="$3"
+  local brief_file="$4"
+  local test_cmd="${5-}"
+
+  if [[ ! -d "$repo_path" ]]; then
+    echo "run: repo-path does not exist or is not a directory: $repo_path" >&2
+    return 2
+  fi
+  if [[ ! -f "$brief_file" ]]; then
+    echo "run: brief-file does not exist or is not a regular file: $brief_file" >&2
+    return 2
+  fi
+  case "$worker" in
+    qwen) ;;
+    *) echo "run: worker must be 'qwen'; got '$worker'" >&2; return 2;;
+  esac
+
+  local common_dir repo job_id worker_base
+  common_dir="$(repo_common_dir_from_path "$repo_path")"
+  repo="$(repo_name_from_path "$repo_path")"
+  job_id="$(new_job_id)"
+  printf 'JOB_ID: %s\n' "$job_id"
+
+  if ! git -C "$common_dir" show-ref --verify --quiet "refs/heads/${base_branch}"; then
+    echo "run: local branch '${base_branch}' does not exist" >&2
+    return 1
+  fi
+
+  worker_base="$(_sync_requested_base "$common_dir" "$base_branch")" || {
+    echo "run: failed to sync and verify requested base in bare repo" >&2
+    return 1
+  }
+  printf 'BASE_REF: %s SHA: %s REPO: %s\n' "$worker_base" "$(git -C "$common_dir" rev-parse "refs/heads/${base_branch}")" "$repo"
+
+  scp "$brief_file" "${SSH_HOST}:${REMOTE_BRIEFS_DIR}/${job_id}.md"
+
+  local q_test_cmd=""
+  if [[ -n "$test_cmd" ]]; then
+    q_test_cmd="$(printf %q "$test_cmd")"
+  else
+    q_test_cmd="''"
+  fi
+
+  local remote_cmd
+  local q_mode="--editable" q_user=""
+  if [[ "$read_only" == "1" ]]; then
+    q_mode="--read-only"
+    q_user="--user 0"
+  fi
+  printf -v remote_cmd 'docker exec %s %s /work/bin/run-job.sh %s %s %s %s /work/briefs/%s.md %s %s' \
+    "$q_user" "$CONTAINER" "$repo" "$worker_base" "$worker" "$job_id" "$job_id" "$q_test_cmd" "$q_mode"
+
+  local envelope
+  envelope="$(ssh "${SSH_HOST}" "$remote_cmd")"
+  printf '%s\n' "$envelope"
+
+  local status_line=""
+  status_line="$(printf '%s\n' "$envelope" | awk -F': ' '/^STATUS: /{print $2; exit}')"
+
+  local worker_branch="agent/${job_id}-${worker}"
+  local fetched_ref="worker-remote/${worker_branch}"
+  if [[ "$status_line" != "ERROR" && "$read_only" != "1" ]]; then
+    if ! git -C "$common_dir" fetch --quiet worker-remote "${worker_branch}:refs/remotes/${fetched_ref}"; then
+      echo "run: failed to fetch worker branch '${worker_branch}' from worker-remote; cannot verify it" >&2
+      return 1
+    fi
+    if ! git -C "$common_dir" show-ref --verify --quiet "refs/heads/${worker_branch}"; then
+      git -C "$common_dir" branch -f "$worker_branch" "$fetched_ref"
+    fi
+  fi
+
+  local final_rc=1
+  if [[ "$status_line" == "DONE" ]]; then
+    final_rc=0
+  fi
+  local final_line="FINAL: STATUS=${status_line:-UNKNOWN} RC=${final_rc} JOB_ID=${job_id}"
+  ssh "${SSH_HOST}" "docker exec ${CONTAINER} sh -c 'printf \"%s\\n\" \"${final_line}\" >> /work/logs/${job_id}.log'" || {
+    echo "run: failed to append final status to server log for ${job_id}" >&2
+  }
+  printf '%s\n' "$final_line"
+  return "$final_rc"
+}
+
+
+# ---------------------------------------------------------------------------
+# Dispatcher-backed verbs (unchanged verbs; same JSON-in/JSON-out contract)
+# ---------------------------------------------------------------------------
+
+cmd_logs() {
+  if [[ $# -ne 1 ]]; then
+    echo "logs: expected exactly 1 argument (<job-id>); got $#" >&2
+    return 2
+  fi
+  local job_id="$1"
+  if ! [[ "$job_id" =~ ${RW_JOBID_RE} ]]; then
+    echo "logs: invalid job-id '$job_id' (must match ${RW_JOBID_RE})" >&2
+    return 2
+  fi
+  local payload
+  payload="$(_rw_payload log_tail "job_id=$job_id" --int "n=200")"
+  _dispatch_call "$payload"
+}
+
+cmd_status() {
+  if [[ $# -eq 0 ]]; then
+    # Legacy behaviour (matches the live wrapper): container status +
+    # slot dir listing over plain SSH.
+    ssh "${SSH_HOST}" 'docker ps --filter name=agent-runner --format "{{.Status}}"; ls ~/agent-work/slots'
+    return $?
+  fi
+  if [[ $# -ne 1 ]]; then
+    echo "status: expected 0 or 1 argument; got $#" >&2
+    return 2
+  fi
+  local job_id="$1"
+  if ! [[ "$job_id" =~ ${RW_JOBID_RE} ]]; then
+    echo "status: invalid job-id '$job_id' (must match ${RW_JOBID_RE})" >&2
+    return 2
+  fi
+  local payload
+  payload="$(_rw_payload status "job_id=$job_id")"
+  _dispatch_call "$payload"
+}
+
+cmd_health() {
+  if [[ $# -ne 0 ]]; then
+    echo "health: takes no arguments" >&2
+    return 2
+  fi
+  _dispatch_call '{"action":"health"}'
+}
+
+cmd_slots() {
+  if [[ $# -ne 0 ]]; then
+    echo "slots: takes no arguments" >&2
+    return 2
+  fi
+  _dispatch_call '{"action":"slots"}'
+}
+
+cmd_list_jobs() {
+  if [[ $# -ne 0 ]]; then
+    echo "list-jobs: takes no arguments" >&2
+    return 2
+  fi
+  _dispatch_call '{"action":"list_jobs","limit":50}'
+}
+
+cmd_result() {
+  if [[ $# -ne 1 ]]; then
+    echo "result: expected exactly 1 argument (<job-id>); got $#" >&2
+    return 2
+  fi
+  local job_id="$1"
+  if ! [[ "$job_id" =~ ${RW_JOBID_RE} ]]; then
+    echo "result: invalid job-id '$job_id' (must match ${RW_JOBID_RE})" >&2
+    return 2
+  fi
+  local payload
+  payload="$(_rw_payload result "job_id=$job_id")"
+  _dispatch_call "$payload"
+}
+
+cmd_diff() {
+  local repo="" base="" target=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --repo)
+        [[ $# -ge 2 ]] || { echo "diff: --repo requires an argument" >&2; return 2; }
+        repo="$2"; shift 2 ;;
+      --repo=*) repo="${1#--repo=}"; shift ;;
+      --base)
+        [[ $# -ge 2 ]] || { echo "diff: --base requires an argument" >&2; return 2; }
+        base="$2"; shift 2 ;;
+      --base=*) base="${1#--base=}"; shift ;;
+      --branch)
+        [[ $# -ge 2 ]] || { echo "diff: --branch requires an argument" >&2; return 2; }
+        target="$2"; shift 2 ;;
+      --branch=*) target="${1#--branch=}"; shift ;;
+      -h|--help)
+        echo "Usage: remote-worker diff --repo NAME --base BRANCH [--branch TARGET]" >&2
+        return 2 ;;
+      --) shift; break ;;
+      -*)
+        echo "diff: unknown option: $1" >&2; return 2 ;;
+      *)
+        echo "diff: unexpected positional argument: $1" >&2; return 2 ;;
+    esac
+  done
+  if [[ -z "$repo" || -z "$base" ]]; then
+    echo "diff: --repo and --base are required" >&2
+    return 2
+  fi
+  if ! [[ "$repo" =~ ${RW_REPO_RE} ]]; then
+    echo "diff: invalid --repo '$repo' (must match ${RW_REPO_RE})" >&2
+    return 2
+  fi
+  if ! [[ "$base" =~ ${RW_BRANCH_RE} ]]; then
+    echo "diff: invalid --base '$base' (must match ${RW_BRANCH_RE})" >&2
+    return 2
+  fi
+  local payload
+  if [[ -n "$target" ]]; then
+    if ! [[ "$target" =~ ${RW_BRANCH_RE} ]]; then
+      echo "diff: invalid --branch '$target' (must match ${RW_BRANCH_RE})" >&2
+      return 2
+    fi
+    payload="$(_rw_payload diff "repo=$repo" "base_branch=$base" "branch=$target")"
+  else
+    payload="$(_rw_payload diff "repo=$repo" "base_branch=$base")"
+  fi
+  _dispatch_call "$payload"
+}
+
+cmd_cancel() {
+  if [[ $# -ne 1 ]]; then
+    echo "cancel: expected exactly 1 argument (<job-id>); got $#" >&2
+    return 2
+  fi
+  local job_id="$1"
+  if ! [[ "$job_id" =~ ${RW_JOBID_RE} ]]; then
+    echo "cancel: invalid job-id '$job_id' (must match ${RW_JOBID_RE})" >&2
+    return 2
+  fi
+  local payload
+  payload="$(_rw_payload cancel "job_id=$job_id")"
+  _dispatch_call "$payload"
+}
+
+
+# ---------------------------------------------------------------------------
+# Capacity guard helpers
+# ---------------------------------------------------------------------------
+
+# Derive (active, queued, running, slot_capacity, kind_active,
+# kind_queued, kind_running, kind_cap) from the dispatcher using list_jobs
+# + slots, in a single Python parser pass.  $1 is the worker kind being
+# submitted (qwen|claude).
+#
+# The kind_* figures are counted from the jobs array by worker type, not
+# from the unfiltered summary: rq-worker-claude jobs used to be counted
+# against the qwen slots, so a running canary could make qwen submits
+# refuse with "3 running + 0 queued >= hard cap 3" while qwen-2 sat idle.
+# kind_cap is derived from the number of RQ workers serving that kind's
+# queues, so a kind's own workers are budgeted separately from the pool
+# as a whole.  The overall RW_HARD_MAX_CAPACITY guard is still enforced
+# on top of that.
+_capacity_from_dispatcher() {
+  local kind="${1:-qwen}"
+  local list_resp slots_resp
+  if ! list_resp="$(_dispatch_call '{"action":"list_jobs","limit":200,"active_only":true}')"; then
+    return 2
+  fi
+  if ! slots_resp="$(_dispatch_call '{"action":"slots"}')"; then
+    return 2
+  fi
+  python3 - "$list_resp" "$slots_resp" "$kind" <<'PY'
+import json, sys
+list_resp, slots_resp, kind = sys.argv[1], sys.argv[2], sys.argv[3].strip().lower()
+try:
+    lj = json.loads(list_resp)
+    sl = json.loads(slots_resp)
+except Exception:
+    sys.exit(2)
+RW_HARD_MAX_CAPACITY = 5
+# Fallback caps if live slot metadata is unavailable. Live worker queue
+# registration overrides these values when present.
+DEFAULT_KIND_CAP = dict(qwen=5, claude=5)
+
+def job_kind(j):
+    return str(j.get("worker") or j.get("engine") or "").strip().lower()
+
+def matches(j):
+    k = job_kind(j)
+    return k == kind or k.startswith(kind)
+
+jobs = lj.get("jobs") or [] if isinstance(lj, dict) else []
+summary = lj.get("summary") if isinstance(lj, dict) else None
+if isinstance(summary, dict) and "active" in summary:
+    active  = int(summary.get("active")  or 0)
+    queued  = int(summary.get("queued")  or 0)
+    running = int(summary.get("running") or 0)
+else:
+    active  = sum(1 for j in jobs if isinstance(j, dict) and j.get("state") in ("running","queued","starting"))
+    queued  = sum(1 for j in jobs if isinstance(j, dict) and j.get("state") == "queued")
+    running = sum(1 for j in jobs if isinstance(j, dict) and j.get("state") == "running")
+
+# Per-kind counts.  If the dispatcher omitted the jobs array there is
+# nothing to attribute, so fall back to the overall totals rather than
+# reporting a falsely-free kind.
+if jobs:
+    kind_active  = sum(1 for j in jobs if isinstance(j, dict) and matches(j)
+                       and j.get("state") in ("running","queued","starting"))
+    kind_queued  = sum(1 for j in jobs if isinstance(j, dict) and matches(j)
+                       and j.get("state") == "queued")
+    kind_running = sum(1 for j in jobs if isinstance(j, dict) and matches(j)
+                       and j.get("state") == "running")
+else:
+    kind_active, kind_queued, kind_running = active, queued, running
+
+# One slot per RQ worker listening on a queue belonging to this kind.
+kind_cap = DEFAULT_KIND_CAP.get(kind, 1)
+if isinstance(sl, dict) and isinstance(sl.get("workers"), list):
+    served = 0
+    for w in sl["workers"]:
+        if not isinstance(w, dict):
+            continue
+        qt = w.get("queue_type") or []
+        if any(str(q).strip().lower().startswith(kind) for q in qt):
+            served += 1
+    if served >= 1:
+        kind_cap = served
+
+cap = RW_HARD_MAX_CAPACITY
+if isinstance(sl, dict):
+    if isinstance(sl.get("capacity"), int) and sl["capacity"] >= 1:
+        cap = min(sl["capacity"], RW_HARD_MAX_CAPACITY)
+    elif isinstance(sl.get("max_parallel"), int) and sl["max_parallel"] >= 1:
+        cap = min(sl["max_parallel"], RW_HARD_MAX_CAPACITY)
+
+print("%d %d %d %d %d %d %d %d" % (active, queued, running, cap,
+                                    kind_active, kind_queued, kind_running,
+                                    kind_cap))
+PY
+}
+
+
+# ---------------------------------------------------------------------------
+# submit
+# ---------------------------------------------------------------------------
+
+cmd_submit() {
+  local repo="" base="" brief_file="" worker="claude" mode="" test_cmd="" non_code=0 priority="normal" do_wait=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --repo)
+        [[ $# -ge 2 ]] || { echo "submit: --repo requires an argument" >&2; return 2; }
+        repo="$2"; shift 2 ;;
+      --repo=*) repo="${1#--repo=}"; shift ;;
+      --base)
+        [[ $# -ge 2 ]] || { echo "submit: --base requires an argument" >&2; return 2; }
+        base="$2"; shift 2 ;;
+      --base=*) base="${1#--base=}"; shift ;;
+      --brief-file)
+        [[ $# -ge 2 ]] || { echo "submit: --brief-file requires an argument" >&2; return 2; }
+        brief_file="$2"; shift 2 ;;
+      --brief-file=*) brief_file="${1#--brief-file=}"; shift ;;
+      --worker)
+        [[ $# -ge 2 ]] || { echo "submit: --worker requires an argument" >&2; return 2; }
+        worker="$2"; shift 2 ;;
+      --worker=*) worker="${1#--worker=}"; shift ;;
+      --test-cmd)
+        [[ $# -ge 2 ]] || { echo "submit: --test-cmd requires an argument" >&2; return 2; }
+        test_cmd="$2"; shift 2 ;;
+      --test-cmd=*) test_cmd="${1#--test-cmd=}"; shift ;;
+      --editable) mode="--editable"; shift ;;
+      --read-only) mode="--read-only"; shift ;;
+      --non-code) non_code=1; shift ;;
+      --wait) do_wait=1; shift ;;
+      --priority)
+        [[ $# -ge 2 ]] || { echo "submit: --priority requires an argument" >&2; return 2; }
+        priority="$2"; shift 2 ;;
+      --priority=*) priority="${1#--priority=}"; shift ;;
+      -h|--help)
+        echo "Usage: remote-worker submit --repo NAME --base BRANCH --brief-file PATH [--worker qwen] (--editable|--read-only) [--test-cmd CMD] [--non-code] [--priority high|normal|low] [--wait]" >&2
+        return 2 ;;
+      --) shift; break ;;
+      -*)
+        echo "submit: unknown option: $1" >&2; return 2 ;;
+      *)
+        echo "submit: unexpected positional argument: $1" >&2; return 2 ;;
+    esac
+  done
+
+  if [[ -z "$repo" ]]; then echo "submit: --repo is required" >&2; return 2; fi
+  if [[ -z "$base" ]]; then echo "submit: --base is required" >&2; return 2; fi
+  if [[ -z "$brief_file" ]]; then echo "submit: --brief-file is required" >&2; return 2; fi
+  if [[ -z "$mode" ]]; then
+    echo "submit: exactly one of --editable or --read-only is required" >&2
+    return 2
+  fi
+
+  if ! [[ "$repo"     =~ ${RW_REPO_RE}     ]]; then echo "submit: invalid --repo '$repo' (must match ${RW_REPO_RE})" >&2; return 2; fi
+  if ! [[ "$base"     =~ ${RW_BRANCH_RE}   ]]; then echo "submit: invalid --base '$base' (must match ${RW_BRANCH_RE})" >&2; return 2; fi
+  if ! [[ "$worker"   =~ ${RW_WORKER_RE}   ]]; then echo "submit: invalid --worker '$worker' (must match ${RW_WORKER_RE})" >&2; return 2; fi
+  if ! [[ "$mode"     =~ ${RW_MODE_RE}     ]]; then echo "submit: invalid mode '$mode' (must match ${RW_MODE_RE})" >&2; return 2; fi
+  if ! [[ "$priority" =~ ${RW_PRIORITY_RE} ]]; then echo "submit: invalid --priority '$priority' (must match ${RW_PRIORITY_RE})" >&2; return 2; fi
+  if [[ ! -f "$brief_file" ]]; then
+    echo "submit: --brief-file '$brief_file' does not exist or is not a regular file" >&2
+    return 2
+  fi
+
+  if [[ "$mode" == "--editable" && -z "$test_cmd" && $non_code -eq 0 ]]; then
+    echo "submit: --editable requires a non-empty --test-cmd (or pass --non-code)" >&2
+    return 2
+  fi
+  if [[ $non_code -eq 1 && -z "$test_cmd" ]]; then
+    test_cmd=": # non-code submit; no test"
+  fi
+
+  # Capacity guard (per W2 brief), now kind-aware:
+  #   * the submitting worker's own kind is counted against the RQ
+  #     workers serving that kind (qwen -> 5)
+  #   * refuse with exit 75 when:
+  #       kind_running + kind_queued >= kind_cap, OR
+  #       overall running + queued >= hard cap (5), OR
+  #       kind_running >= kind_cap AND kind_queued >= RW_QUEUED_GUARD
+  #   * with --wait, an over-cap pool is polled every 30s for up to 30
+  #     minutes and the submit proceeds when it clears.
+  local cap_line active running queued slot_cap
+  local kind_active kind_queued kind_running kind_cap
+  local waited=0 max_waits
+  max_waits=$(( RW_WAIT_TIMEOUT_MINUTES * 60 / RW_WAIT_POLL_SECONDS ))
+
+  while :; do
+    if ! cap_line="$(_capacity_from_dispatcher "$worker")"; then
+      echo "submit: capacity pre-flight failed; refusing to enqueue" >&2
+      return 1
+    fi
+    # shellcheck disable=SC2206
+    local cap_parts=( $cap_line )
+    active="${cap_parts[0]:-0}"
+    queued="${cap_parts[1]:-0}"
+    running="${cap_parts[2]:-0}"
+    slot_cap="${cap_parts[3]:-${RW_HARD_MAX_CAPACITY}}"
+    kind_active="${cap_parts[4]:-0}"
+    kind_queued="${cap_parts[5]:-0}"
+    kind_running="${cap_parts[6]:-0}"
+    kind_cap="${cap_parts[7]:-1}"
+    if [[ ! "$active"  =~ ^[0-9]+$ ]]; then active=0;  fi
+    if [[ ! "$queued"  =~ ^[0-9]+$ ]]; then queued=0;  fi
+    if [[ ! "$running" =~ ^[0-9]+$ ]]; then running=0; fi
+    if [[ ! "$slot_cap" =~ ^[1-9][0-9]*$ ]]; then slot_cap="${RW_HARD_MAX_CAPACITY}"; fi
+    if [[ ! "$kind_active"  =~ ^[0-9]+$ ]]; then kind_active=0;  fi
+    if [[ ! "$kind_queued"  =~ ^[0-9]+$ ]]; then kind_queued=0;  fi
+    if [[ ! "$kind_running" =~ ^[0-9]+$ ]]; then kind_running=0; fi
+    if [[ ! "$kind_cap" =~ ^[1-9][0-9]*$ ]]; then kind_cap=1; fi
+
+    if (( kind_running + kind_queued < kind_cap )) \
+       && (( running + queued < RW_HARD_MAX_CAPACITY )) \
+       && ! (( kind_running >= kind_cap && kind_queued >= RW_QUEUED_GUARD )); then
+      break
+    fi
+
+    if (( do_wait == 0 )); then
+      if (( kind_running + kind_queued >= kind_cap )); then
+        echo "submit: refusing to enqueue: ${worker} has ${kind_running} running + ${kind_queued} queued >= its ${kind_cap} ${worker} worker(s)" >&2
+      fi
+      if (( running + queued >= RW_HARD_MAX_CAPACITY )); then
+        echo "submit: refusing to enqueue: ${running} running + ${queued} queued >= hard cap ${RW_HARD_MAX_CAPACITY} (capacity ${slot_cap})" >&2
+      fi
+      if (( kind_running >= kind_cap && kind_queued >= RW_QUEUED_GUARD )); then
+        echo "submit: refusing to enqueue: ${kind_running} ${worker} running at capacity ${kind_cap} and ${kind_queued} queued >= ${RW_QUEUED_GUARD}" >&2
+      fi
+      echo "submit: pass --wait to queue for a free slot instead of refusing" >&2
+      return 75
+    fi
+
+    if (( waited >= max_waits )); then
+      echo "submit: --wait timed out after ${RW_WAIT_TIMEOUT_MINUTES}m waiting for a ${worker} slot (${kind_running} running + ${kind_queued} queued, kind cap ${kind_cap})" >&2
+      return 75
+    fi
+    waited=$(( waited + 1 ))
+    echo "submit: at cap (${worker}: ${kind_running} running + ${kind_queued} queued / cap ${kind_cap}; overall ${running}+${queued} / ${RW_HARD_MAX_CAPACITY}); --wait poll ${waited}/${max_waits} in ${RW_WAIT_POLL_SECONDS}s" >&2
+    sleep "${RW_WAIT_POLL_SECONDS}"
+  done
+
+  if (( waited > 0 )); then
+    echo "submit: --wait cleared after ${waited} poll(s); enqueueing ${worker} job" >&2
+  fi
+
+  # The brief is read by python straight from the file: passing it as an
+  # argv value would put a whole markdown brief through the shell.
+  local payload
+  payload="$(_rw_payload submit "repo=$repo" "base_branch=$base" "worker=$worker" \
+    "mode=$mode" --file "task=$brief_file" "test_cmd=$test_cmd" "priority=$priority")"
+  _dispatch_call "$payload"
+}
+
+
+
+
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# gc  (unchanged from live wrapper)
+# ---------------------------------------------------------------------------
+
+_gc_write_remote_script() {
+  local out="$1" dry="$2" days="$3"
+  cat >"$out" <<'GCEOF'
+#!/usr/bin/env bash
+# Generated by remote-worker gc; do not edit by hand.
+set -u
+DAYS=__DAYS__
+DRY=__DRY__
+LOG_DIR='/work/logs'
+BRIEF_DIR='/work/briefs'
+JOBS_DIR='/work/jobs'
+WT_DIR='/work/worktrees'
+SLOT_DIR='/work/slots'
+REPO_DIR='/work/repos'
+
+ACTIVE_SLOTS=""
+if [[ -d "${SLOT_DIR}" ]]; then
+  for s in "${SLOT_DIR}"/*/; do
+    [[ -d "$s" ]] || continue
+    n="$(basename "$s")"
+    ACTIVE_SLOTS="${ACTIVE_SLOTS}${n} "
+  done
+fi
+
+do_rm() {
+  local kind="$1" path="$2"
+  if [[ "${DRY}" == "1" ]]; then
+    printf '  [DRY] %-9s %s\n' "${kind}" "${path}"
+  else
+    printf '  [DEL] %-9s %s\n' "${kind}" "${path}"
+    rm -rf -- "${path}"
+  fi
+}
+
+section() { printf '\n=== %s ===\n' "$*"; }
+
+section "jobs/*-verify older than ${DAYS} days"
+if [[ -d "${JOBS_DIR}" ]]; then
+  while IFS= read -r -d '' d; do
+    base="$(basename "$d")"
+    case "$base" in
+      *-verify) ;;
+      *) continue ;;
+    esac
+    job_id="${base%-verify}"
+    case " ${ACTIVE_SLOTS} " in
+      *" ${job_id} "*) continue ;;
+    esac
+    if find "$d" -maxdepth 0 -mtime +${DAYS} -print -quit >/dev/null 2>&1; then
+      do_rm job-verify "$d"
+    fi
+  done < <(find "${JOBS_DIR}" -maxdepth 1 -mindepth 1 -type d -name '*-verify' -print0 2>/dev/null)
+fi
+
+section "briefs older than ${DAYS} days"
+if [[ -d "${BRIEF_DIR}" ]]; then
+  while IFS= read -r -d '' f; do
+    do_rm brief "$f"
+  done < <(find "${BRIEF_DIR}" -maxdepth 1 -mindepth 1 -type f -mtime +${DAYS} -print0 2>/dev/null)
+fi
+
+section "logs (job logs) older than ${DAYS} days"
+if [[ -d "${LOG_DIR}" ]]; then
+  while IFS= read -r -d '' f; do
+    base="$(basename "$f")"
+    case "$base" in
+      build*.log) continue ;;
+    esac
+    do_rm log "$f"
+  done < <(find "${LOG_DIR}" -maxdepth 1 -mindepth 1 -type f -name '*.log' -mtime +${DAYS} -print0 2>/dev/null)
+fi
+
+section "git worktrees + agent/* branches"
+if [[ -d "${REPO_DIR}" ]]; then
+  for r in "${REPO_DIR}"/*.git; do
+    [[ -d "$r" ]] || continue
+    rname="$(basename "$r" .git)"
+    printf '\n-- repo=%s --\n' "${rname}"
+
+    BASE=""
+    for b in main master; do
+      if git -C "$r" rev-parse --verify --quiet "refs/heads/${b}" >/dev/null 2>&1; then
+        BASE="${b}"
+        break
+      fi
+    done
+
+    wt_list="$(git -C "$r" worktree list --porcelain 2>/dev/null || true)"
+    wt_path=""
+    while IFS= read -r line; do
+      case "$line" in
+        "worktree "*)
+          wt_path="${line#worktree }"
+          ;;
+        "")
+          if [[ -n "$wt_path" && ! -e "$wt_path" ]]; then
+            do_rm worktree "$wt_path"
+          fi
+          wt_path=""
+          ;;
+      esac
+    done <<< "$wt_list"
+    if [[ "${DRY}" != "1" ]]; then
+      git -C "$r" worktree prune >/dev/null 2>&1 || true
+    fi
+
+    threshold="$(date -u +%s)"
+    threshold=$((threshold - DAYS*86400))
+    while IFS= read -r branch; do
+      [[ -z "$branch" ]] && continue
+      case "$branch" in
+        agent/*) ;;
+        *) continue ;;
+      esac
+      leaf="${branch#agent/}"
+      worker="${leaf##*-}"
+      job_id="${leaf%-${worker}}"
+      case " ${ACTIVE_SLOTS} " in
+        *" ${job_id} "*) echo "  [SKIP] active-slot branch ${branch}"; continue ;;
+      esac
+      branch_mtime="$(git -C "$r" log -1 --format=%ct "$branch" 2>/dev/null || echo 0)"
+      if [[ "${branch_mtime}" -gt "${threshold}" ]]; then
+        continue
+      fi
+      merged=0
+      if [[ -n "${BASE}" ]]; then
+        if git -C "$r" branch --list "$branch" --merged "${BASE}" 2>/dev/null | grep -qx "$branch"; then
+          merged=1
+        fi
+      fi
+      job_log="${LOG_DIR}/${job_id}.log"
+      safe=0
+      if [[ "${merged}" == "1" ]]; then
+        safe=1
+      elif [[ -f "${job_log}" ]] && ! grep -q '^STATUS: DONE' "${job_log}" 2>/dev/null; then
+        safe=1
+      elif [[ ! -f "${job_log}" ]]; then
+        safe=1
+      fi
+      if [[ "${safe}" == "1" ]]; then
+        if [[ "${DRY}" == "1" ]]; then
+          printf '  [DRY] branch    %s\n' "${branch}"
+        else
+          printf '  [DEL] branch    %s\n' "${branch}"
+          git -C "$r" branch -D "$branch" >/dev/null 2>&1 || true
+        fi
+      else
+        echo "  [KEEP] unmerged+done branch ${branch} (job ${job_id} STATUS: DONE)"
+      fi
+    done < <(git -C "$r" for-each-ref --format='%(refname:short)' refs/heads/agent/ 2>/dev/null)
+  done
+fi
+GCEOF
+  /usr/bin/sed -i '' "s/__DAYS__/${days}/g; s/__DRY__/${dry}/g" "$out"
+}
+
+
+cmd_gc() {
+  local days="3" dry="0"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --days)
+        [[ $# -ge 2 ]] || { echo "gc: --days requires an argument" >&2; return 2; }
+        days="$2"; shift 2 ;;
+      --days=*) days="${1#--days=}"; shift ;;
+      --dry-run) dry="1"; shift ;;
+      -h|--help) usage; return 0 ;;
+      --) shift; break ;;
+      -*) echo "gc: unknown option: $1" >&2; return 2 ;;
+      *) echo "gc: unexpected positional argument: $1" >&2; return 2 ;;
+    esac
+  done
+
+  if ! [[ "$days" =~ ^[0-9]+$ ]]; then
+    echo "gc: --days must be a non-negative integer; got '$days'" >&2
+    return 2
+  fi
+
+  printf '[gc] days=%s dry-run=%s host=%s container=%s\n' \
+    "$days" "$dry" "$SSH_HOST" "$CONTAINER"
+
+  local tmp_local tmp_remote rc
+  tmp_local="$(mktemp -t remote-worker-gc.XXXXXX)"
+  tmp_remote="/tmp/$(basename "$tmp_local")"
+  _gc_write_remote_script "$tmp_local" "$dry" "$days"
+  if ! bash -n "$tmp_local"; then
+    echo "gc: generated remote script failed bash -n; aborting" >&2
+    rm -f "$tmp_local"
+    return 1
+  fi
+
+  ssh "${SSH_HOST}" "docker exec -i ${CONTAINER} tee ${tmp_remote} >/dev/null" \
+    <"$tmp_local"
+  ssh "${SSH_HOST}" "docker exec ${CONTAINER} bash ${tmp_remote}"
+  rc=$?
+  ssh "${SSH_HOST}" "docker exec ${CONTAINER} rm -f ${tmp_remote}" >/dev/null 2>&1 || true
+  rm -f "$tmp_local"
+
+  if [[ "$dry" == "1" ]]; then
+    printf '\n[gc] dry-run complete; nothing was deleted.\n'
+  else
+    printf '\n[gc] gc complete.\n'
+  fi
+  return $rc
+}
+
+
+# ---------------------------------------------------------------------------
+# wait / digest / fetch  (L1 read path, l1opt lane C)
+# ---------------------------------------------------------------------------
+#
+# Three new verbs. They never call ssh by hand and never run docker exec:
+# every request goes through _dispatch_call, so dispatch-ssh-entry.sh stays
+# the only door and the JSON contract is the same as every other verb.
+#
+#   wait <job-id> [--timeout S] [--poll S]
+#       Poll until the job reaches a terminal state, print its digest, and
+#       exit 0 for SUCCESS, 2 for PARTIAL_OK, 1 for anything else (failed,
+#       blocked, cancelled, unknown job, or timed out). A transport blip is
+#       retried until --timeout, so exit 2 always means PARTIAL_OK.
+#   digest <job-id>
+#       Print at most 8 TOON lines: verdict, verdicts, tests, cost,
+#       artifacts, warnings, next_action (docs/l1opt/CONTRACT.md).
+#   fetch <job-id> <path> [-o OUT]
+#       Write the exact bytes of one file from the job branch; without -o
+#       the bytes go to stdout.
+#
+# The job id and the fetch path are validated here as well as on the server:
+# a path that could escape the repository never reaches argv.
+
+# Terminal dispatcher states (mirrors the dispatcher's own set).
+readonly RW_TERMINAL_STATES=" done test_failed blocked error cancelled failed "
+# How long `wait` blocks by default, and how often it asks. Both are
+# overridable from the environment so a test can run them in milliseconds.
+readonly RW_WAIT_TIMEOUT="${REMOTE_WORKER_WAIT_TIMEOUT:-1800}"
+readonly RW_WAIT_POLL="${REMOTE_WORKER_WAIT_POLL:-5}"
+# A fetch path is repository-relative, forward-slashed and traversal-free.
+readonly RW_PATH_RE='^[A-Za-z0-9._][A-Za-z0-9._/+-]*$'
+
+# Print one top-level field of the dispatcher JSON on stdin, or nothing.
+# Non-JSON input yields the empty string, never a traceback.
+_rw_json_field() {
+  python3 -c '
+import json, sys
+try:
+    data = json.loads(sys.stdin.read())
+except Exception:
+    sys.exit(0)
+value = data.get(sys.argv[1]) if isinstance(data, dict) else None
+if isinstance(value, (dict, list)):
+    value = json.dumps(value, sort_keys=True)
+print("" if value is None else value)
+' "$1" 2>/dev/null || true
+}
+
+# Print the state of the first job in a `status` response.
+_rw_job_state() {
+  python3 -c '
+import json, sys
+try:
+    data = json.loads(sys.stdin.read())
+except Exception:
+    sys.exit(0)
+if not isinstance(data, dict):
+    sys.exit(0)
+jobs = data.get("jobs") or []
+if isinstance(jobs, list) and jobs and isinstance(jobs[0], dict):
+    print(str(jobs[0].get("state") or "").strip().lower())
+else:
+    print(str(data.get("state") or "").strip().lower())
+' 2>/dev/null || true
+}
+
+# Requests are shaped by _rw_payload above, so wait/digest/fetch cannot
+# drift from the dispatcher schema -- and cannot grow a brace literal that
+# bash 3.2 would eat on the Mac either.
+
+cmd_wait() {
+  local job_id="" timeout_s="${RW_WAIT_TIMEOUT}" poll_s="${RW_WAIT_POLL}"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --timeout)
+        [[ $# -ge 2 ]] || { echo "wait: --timeout requires an argument" >&2; return 2; }
+        timeout_s="$2"; shift 2 ;;
+      --timeout=*) timeout_s="${1#--timeout=}"; shift ;;
+      --poll)
+        [[ $# -ge 2 ]] || { echo "wait: --poll requires an argument" >&2; return 2; }
+        poll_s="$2"; shift 2 ;;
+      --poll=*) poll_s="${1#--poll=}"; shift ;;
+      -h|--help)
+        echo "Usage: remote-worker wait <job-id> [--timeout S] [--poll S]" >&2
+        return 2 ;;
+      --) shift; break ;;
+      -*) echo "wait: unknown option: $1" >&2; return 2 ;;
+      *)
+        if [[ -z "$job_id" ]]; then job_id="$1"
+        else echo "wait: unexpected positional argument: $1" >&2; return 2; fi
+        shift ;;
+    esac
+  done
+  if [[ -z "$job_id" ]]; then
+    echo "wait: expected exactly 1 argument (<job-id>); got 0" >&2
+    return 2
+  fi
+  if ! [[ "$job_id" =~ ${RW_JOBID_RE} ]]; then
+    echo "wait: invalid job-id '$job_id' (must match ${RW_JOBID_RE})" >&2
+    return 2
+  fi
+  if ! [[ "$timeout_s" =~ ^[0-9]+$ ]]; then
+    echo "wait: --timeout must be a non-negative integer; got '$timeout_s'" >&2
+    return 2
+  fi
+  if ! [[ "$poll_s" =~ ^[0-9]+$ ]]; then
+    echo "wait: --poll must be a non-negative integer; got '$poll_s'" >&2
+    return 2
+  fi
+
+  local deadline state="unknown" resp="" rc=0 payload
+  deadline=$(( $(date +%s) + timeout_s ))
+  while :; do
+    rc=0
+    payload="$(_rw_payload status "job_id=$job_id")"
+    resp="$(_dispatch_call "$payload")" || rc=$?
+    if [[ $rc -eq 1 ]]; then
+      # ok:false is the dispatcher's own statement that it has no such job;
+      # waiting for it to appear would only burn the timeout.
+      echo "wait: dispatcher error for ${job_id}: $(printf '%s' "$resp" | _rw_json_field error)" >&2
+      return 1
+    fi
+    if [[ $rc -eq 0 ]]; then
+      state="$(printf '%s' "$resp" | _rw_job_state)"
+      [[ -n "$state" ]] || state="unknown"
+      if [[ "${state}" == "unknown" ]]; then
+        echo "wait: unknown job: ${job_id}" >&2
+        return 1
+      fi
+      if [[ " ${RW_TERMINAL_STATES} " == *" ${state} "* ]]; then
+        break
+      fi
+    fi
+    if (( $(date +%s) >= deadline )); then
+      echo "wait: timed out after ${timeout_s}s (last state: ${state})" >&2
+      return 1
+    fi
+    [[ $rc -eq 0 ]] || echo "wait: status poll failed (rc=${rc}); retrying" >&2
+    [[ "${poll_s}" == "0" ]] || sleep "${poll_s}"
+  done
+
+  # One digest answers both "what happened" and "with which code": the
+  # verdict is the single source of truth for the answer and the exit code.
+  local digest_resp verdict toon
+  rc=0
+  payload="$(_rw_payload digest "job_id=$job_id")"
+  digest_resp="$(_dispatch_call "$payload")" || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    echo "wait: job ${job_id} reached state '${state}' but its digest could not be read" >&2
+    return 1
+  fi
+  verdict="$(printf '%s' "$digest_resp" | _rw_json_field verdict)"
+  toon="$(printf '%s' "$digest_resp" | _rw_json_field toon)"
+  if [[ -n "$toon" ]]; then printf '%s\n' "$toon"; fi
+  printf 'state=%s\n' "$state"
+
+  case "$verdict" in
+    SUCCESS)    return 0 ;;
+    PARTIAL_OK) return 2 ;;
+    *)
+      echo "wait: ${job_id} verdict=${verdict:-unknown} state=${state}" >&2
+      return 1
+      ;;
+  esac
+}
+
+cmd_digest() {
+  if [[ $# -ne 1 ]]; then
+    echo "digest: expected exactly 1 argument (<job-id>); got $#" >&2
+    return 2
+  fi
+  local job_id="$1"
+  if ! [[ "$job_id" =~ ${RW_JOBID_RE} ]]; then
+    echo "digest: invalid job-id '$job_id' (must match ${RW_JOBID_RE})" >&2
+    return 2
+  fi
+  local resp rc=0 toon payload
+  payload="$(_rw_payload digest "job_id=$job_id")"
+  resp="$(_dispatch_call "$payload")" || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    echo "digest: dispatcher refused the digest for ${job_id} (rc=${rc})" >&2
+    return "$rc"
+  fi
+  toon="$(printf '%s' "$resp" | _rw_json_field toon)"
+  if [[ -z "$toon" ]]; then
+    echo "digest: dispatcher returned no TOON for ${job_id}" >&2
+    return 1
+  fi
+  printf '%s\n' "$toon"
+}
+
+cmd_fetch() {
+  local job_id="" path="" out=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -o|--output)
+        [[ $# -ge 2 ]] || { echo "fetch: $1 requires an argument" >&2; return 2; }
+        out="$2"; shift 2 ;;
+      -o=*|--output=*) out="${1#*=}"; shift ;;
+      -h|--help)
+        echo "Usage: remote-worker fetch <job-id> <path> [-o OUT]" >&2
+        return 2 ;;
+      --) shift; break ;;
+      -*) echo "fetch: unknown option: $1" >&2; return 2 ;;
+      *)
+        if [[ -z "$job_id" ]]; then job_id="$1"
+        elif [[ -z "$path" ]]; then path="$1"
+        else echo "fetch: unexpected positional argument: $1" >&2; return 2; fi
+        shift ;;
+    esac
+  done
+  if [[ -z "$job_id" || -z "$path" ]]; then
+    echo "fetch: expected <job-id> <path> [-o OUT]" >&2
+    return 2
+  fi
+  if ! [[ "$job_id" =~ ${RW_JOBID_RE} ]]; then
+    echo "fetch: invalid job-id '$job_id' (must match ${RW_JOBID_RE})" >&2
+    return 2
+  fi
+  # Refuse the traversals here as well as on the server: an absolute path, a
+  # '..' or '.' component, a trailing slash or an argv-looking path is never
+  # worth sending.
+  case "$path" in
+    /*|~*|-*|:*) echo "fetch: invalid path '$path' (must be a relative path inside the job branch)" >&2; return 2 ;;
+    *//*|*/)     echo "fetch: invalid path '$path' (no empty components)" >&2; return 2 ;;
+  esac
+  case "/${path}/" in
+    */../*|*//*|*/./*) echo "fetch: invalid path '$path' (no '..' or '.' components)" >&2; return 2 ;;
+  esac
+  if ! [[ "$path" =~ ${RW_PATH_RE} ]]; then
+    echo "fetch: invalid path '$path' (must match ${RW_PATH_RE})" >&2
+    return 2
+  fi
+  if [[ -n "$out" && -d "$out" ]]; then
+    echo "fetch: -o '$out' is a directory" >&2
+    return 2
+  fi
+
+  local resp rc=0 payload
+  payload="$(_rw_payload fetch "job_id=$job_id" "path=$path")"
+  resp="$(_dispatch_call "$payload")" || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    echo "fetch: dispatcher refused ${path} for job ${job_id} (rc=${rc})" >&2
+    return "$rc"
+  fi
+
+  # The bytes travel base64 inside the one JSON object the adapter forwards,
+  # so a binary artifact survives the trip and lands byte for byte.
+  if printf '%s' "$resp" | python3 -c '
+import base64, json, os, sys
+try:
+    data = json.loads(sys.stdin.read())
+except Exception:
+    sys.stderr.write("fetch: dispatcher response was not JSON\n")
+    sys.exit(1)
+if not isinstance(data, dict) or not data.get("ok"):
+    sys.stderr.write("fetch: dispatcher error: %s\n" % data.get("error"))
+    sys.exit(1)
+try:
+    blob = base64.b64decode(data.get("content_b64") or "", validate=True)
+except Exception:
+    sys.stderr.write("fetch: dispatcher returned no decodable content\n")
+    sys.exit(1)
+if len(blob) != int(data.get("bytes") or 0):
+    sys.stderr.write("fetch: truncated content (%d of %s bytes)\n"
+                     % (len(blob), data.get("bytes")))
+    sys.exit(1)
+out = sys.argv[1]
+if not out:
+    sys.stdout.buffer.write(blob)
+    sys.stdout.buffer.flush()
+    sys.exit(0)
+tmp = "%s.fetch-%d" % (out, os.getpid())
+with open(tmp, "wb") as fh:
+    fh.write(blob)
+os.replace(tmp, out)
+sys.stderr.write("fetch: wrote %d bytes to %s\n" % (len(blob), out))
+' "$out"; then
+    return 0
+  fi
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+dispatch_command() {
+  if [[ $# -lt 1 ]]; then
+    usage >&2
+    return 2
+  fi
+  case "$1" in
+    -h|--help) usage; return 0 ;;
+    init)      shift; cmd_init      "$@" ;;
+    run)       shift; cmd_run       "$@" ;;
+    logs)      shift; cmd_logs      "$@" ;;
+    status)    shift; cmd_status    "$@" ;;
+    health)    shift; cmd_health    "$@" ;;
+    slots)     shift; cmd_slots     "$@" ;;
+    list-jobs) shift; cmd_list_jobs "$@" ;;
+    result)    shift; cmd_result    "$@" ;;
+    cancel)    shift; cmd_cancel    "$@" ;;
+    diff)      shift; cmd_diff      "$@" ;;
+    submit)    shift; cmd_submit    "$@" ;;
+    gc)        shift; cmd_gc        "$@" ;;
+    wait)      shift; cmd_wait      "$@" ;;
+    digest)    shift; cmd_digest    "$@" ;;
+    fetch)     shift; cmd_fetch     "$@" ;;
+    *)
+      echo "remote-worker: unknown command: $1" >&2
+      usage >&2
+      return 64
+      ;;
+  esac
+}
+
+dispatch_command "$@"
+}
+
+main "$@"; exit

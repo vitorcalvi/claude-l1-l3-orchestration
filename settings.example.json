@@ -1,0 +1,75 @@
+{
+  "cleanupPeriodDays": 14,
+  "env": {
+    "CLAUDE_CODE_EFFORT_LEVEL": "medium",
+    "ENABLE_CLAUDEAI_MCP_SERVERS": "false",
+    "CLAUDE_CODE_ENABLE_TODO_TOOLS": "true"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(ssh worker@zeroclaw-host:*)",
+      "Bash(~/.local/bin/ops-probe:*)",
+      "Bash(source-probe:*)",
+      "Bash(~/.local/bin/source-probe:*)",
+      "Bash(dispatch claude *)",
+      "Bash(~/.local/bin/dispatch *)",
+      "Bash(~/.local/bin/dispatch:*)",
+      "Bash(~/.local/bin/dispatch-plan:*)",
+      "Bash($HOME/.local/bin/dispatch:*)",
+      "Bash(~/.local/bin/remote-worker init:*)",
+      "Bash(~/.local/bin/remote-worker cancel:*)",
+      "Bash(~/.local/bin/remote-worker diff:*)",
+      "Bash(~/.local/bin/remote-worker health:*)",
+      "Bash(~/.local/bin/remote-worker list-jobs:*)",
+      "Bash(~/.local/bin/remote-worker logs:*)",
+      "Bash(~/.local/bin/remote-worker result:*)",
+      "Bash(~/.local/bin/remote-worker slots:*)",
+      "Bash(~/.local/bin/remote-worker status:*)",
+      "Bash(~/.local/bin/remote-worker submit:*)",
+      "Bash(curl -s -m 10 http://127.0.0.1:*)",
+      "Bash(curl -s -m 10 http://localhost:*)",
+      "Bash(git worktree:*)",
+      "Bash(git merge:*)",
+      "Bash(git branch:*)",
+      "Bash(git log:*)",
+      "Bash(git status --porcelain:*)",
+      "Bash(git rev-parse:*)",
+      "Bash(git diff --stat:*)",
+      "Bash(git diff --check:*)",
+      "Bash(git diff -- :*)",
+      "mcp__pencil",
+      "mcp__chatgpt-bridge__reply",
+      "mcp__chatgpt-bridge__ack_processed"
+    ],
+    "defaultMode": "auto"
+  },
+  "disableBundledSkills": true,
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$HOME/.claude/hooks/l1-policy.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "$HOME/.claude/statusline.sh",
+    "padding": 0,
+    "refreshInterval": 60
+  },
+  "modelSettings": {
+    "claude-sonnet-5-5": {
+      "effortLevel": "medium"
+    },
+    "claude-opus-5-5": {
+      "effortLevel": "medium"
+    }
+  }
+}

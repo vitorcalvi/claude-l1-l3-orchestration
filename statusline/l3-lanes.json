@@ -1,0 +1,6 @@
+{
+  "enable": true,
+  "refresh_seconds": 15,
+  "max_age_seconds": 120,
+  "show_when_idle": false
+}
