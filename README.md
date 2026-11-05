@@ -13,12 +13,18 @@ lanes. The goal is fewer L1 tokens with no loss in success rate.
 | `hooks/l1-policy.py`, `hooks/policy.toon` | Capability-policy PreToolUse hook: allow/deny/escalate per tool call, audit log, `shadow` (log only) or `enforce` mode via `L1_POLICY_MODE` |
 | `hooks/post-compact-handoff.sh` | Re-injects handoff context after compaction |
 | `statusline/` | Statusline + HUD: signal bar, news bar, L3 lane status |
+| `skills/autonomy/SKILL.md` | Autonomous decision-making, test-driven continuation, bounded repair and approval boundaries |
+| `docs/autonomous-operation.md` | Setup, smoke test and optional unattended GitHub architecture |
 | `skills/dispatch/SKILL.md` | How L1 dispatches to L3: lanes, envelope, fallback |
 | `bin/dispatch`, `bin/dispatch-plan` | Submit a job brief (or a DAG of lanes) to the worker host, `--async` supported |
 | `bin/remote-worker` | `wait`, `digest`, `fetch`, `status`, `logs`, `slots` for remote jobs |
 | `bin/brief`, `bin/brief.py` | Generate recon/build/verify briefs |
 | `bin/fleet-metrics` | Token and cost baseline from transcripts and the worker ledger |
 | `scripts/export.sh`, `scripts/scan.sh` | How this repo is produced from a private `~/.claude`, and the leak check |
+
+## Autonomous decision mode
+
+Copy `skills/autonomy/SKILL.md` into your Claude Code skills directory and add the matching routing rule to your existing `CLAUDE.md`. It chooses a safe next action and continues to verified results without asking the owner to select routine alternatives. This is an opt-in policy, **not** an installed Mac configuration or a live background scheduler. Existing remote-worker routing, policy hooks, approvals and branch gates still apply. See [autonomous operation](docs/autonomous-operation.md).
 
 ## Using it
 

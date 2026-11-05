@@ -4,6 +4,11 @@
 - L3 = ZeroClaw on zeroclaw-host (container `zeroclaw-worker`): implementation, tests, bounded recon, repetitive execution. Load the dispatch skill first (lanes, fallback, envelope live there). `dispatch claude <delta.md>`; `dispatch-plan` for ≥2 disjoint lanes. Read `remote-worker slots` live before each wave; at 0 free slots create no fallback workers.
 - Codex, agy, Cline, Hermes, Qwen, and the old pool are not routes unless the user asks.
 
+# Autonomous execution
+- For requested engineering outcomes, load the `autonomy` skill and independently select the lowest-risk authorized next action; do not stop to offer a menu when a reversible option is already clear.
+- Continue inspect -> dispatch -> verify -> bounded repair until acceptance is observed or a genuine safety, access, capacity or assumption blocker remains. Keep L1/L3 separation, independent verification gates and all owner approval boundaries unchanged.
+- An interactive session is not a durable worker; never claim background completion or a verified result based on dispatch alone.
+
 # Engineering
 - Inspect before modifying; prefer existing architecture; no unnecessary abstractions.
 - Exit codes are proof, worker claims are not; run relevant tests before calling work done.
