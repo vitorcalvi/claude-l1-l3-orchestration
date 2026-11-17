@@ -29,8 +29,20 @@ policy_id: l1-plan-and-dispatch
 # traffic that would have been refused.
 mode: shadow
 
+# Reason codes the hook still *enforces* even while the global mode is shadow.
+# A deny whose `[reason_code=...]` starts with any of these prefixes is printed
+# on stdout (as if the mode were enforce) instead of being shadow-logged, so a
+# small set of denials can be flipped to active before the whole list moves.
+enforce_reason_prefixes: bash.denied.local-build,bash.denied.read_guard,bash.denied.git_force
+
+# Security codes that stay enforced in every mode and that L1_POLICY_OVERRIDE
+# can never lift (design D2/D3). Prefix match on the reason code.
+locked_reason_prefixes: tool.denied.read_guard,tool.denied.self_protect,bash.denied.remote_destructive,bash.denied.ssh_compound,error.
+
 # Where a shadow run writes its one line per tool call.
 shadow.audit_log: shadow-audit.jsonl
+shadow.log_allow: false
+shadow.max_bytes: 52428800
 # The one sentence every denial ends with. Keep it byte-for-byte stable:
 # the tests and the README both quote it.
 deny_reason: write a brief and dispatch
@@ -40,7 +52,8 @@ deny_reason: write a brief and dispatch
 # decision is unchanged but a warning is appended to the reason. Above
 # soft_limit * ask_multiplier an otherwise allowed call becomes `ask`. The
 # budget never turns into a deny.
-budget.soft_limit: 40
+# 2026-11-15: soft budget off (0). Shadow-only, it produced 258k budget.ask log lines in 14 days and no enforcement.
+budget.soft_limit: 0
 budget.ask_multiplier: 2
 
 # Tools the harness calls on its own behalf rather than on the model's. They
@@ -61,7 +74,7 @@ dispatch_hint: "plan and dispatch instead: write a brief under .claude/plans and
 
 # Capabilities the L1 session is allowed to run directly. Each one is a
 # sanctioned, self-limiting entry point into the remote fleet.
-bash_capabilities[11]{argv0,capability,note}:
+bash_capabilities[17]{argv0,capability,note}:
   dispatch,dispatch,hand a delta to a worker lane and get REMOTE_JOB_ID back
   dispatch-plan,dispatch-plan,split a task into slots and dispatch them
   remote-worker,remote-worker,wait/digest/fetch for an already dispatched job
@@ -73,6 +86,12 @@ bash_capabilities[11]{argv0,capability,note}:
   validate-result,validate-result,validate a worker result envelope
   secret-scan,secret-scan,report masked secret hits and nothing else
   orch-status,orch-status,short status line for the local slots
+  chatgpt-ask,chatgpt-ask,one-shot ChatGPT web advisor via Safari pool
+  gemini-ask,gemini-ask,one-shot Gemini web advisor (4 Argon + Low only)
+  expo-build-remote,expo-build-remote,Expo/Android builds on the Dokploy builder
+  kernel-tests,kernel-tests,run the fixed kernel/policy/compaction test suites (no arguments)
+  verify-wave,verify-wave,tests/tsc gate for a dispatched wave
+  swarm-status,swarm-status,read-only swarm status
 
 # Read-only commands with no path constraint: they print what is already on
 # disk and cannot mutate the filesystem or reach the network.
@@ -159,7 +178,7 @@ bash_read_guards[18]{argv0,mode,value,note}:
 # resolve onto one of these globs is denied. The globs are matched against the
 # resolved absolute path, so `~/.ssh/id_rsa` and `../../.env` land on the same
 # glob as `/home/user/.ssh/id_rsa`.
-bash_read_denied_paths[14]{glob,note}:
+bash_read_denied_paths[15]{glob,note}:
   "~/.ssh/**",ssh keys and known_hosts
   "**/.ssh/**",ssh keys in any checkout
   "**/id_rsa*",ssh private key
@@ -174,6 +193,30 @@ bash_read_denied_paths[14]{glob,note}:
   "**/.git-credentials",credential file
   "**/.aws/credentials",credential file
   "**/etc/shadow",system password hashes
+  "~/.secrets/**",owner secret files
+
+# Paths the file tools (Read, Grep, Glob, Edit, Write, MultiEdit, NotebookEdit)
+# may never touch (design D1 read_guard). Enforced in every mode. `.env` and
+# keystores are deliberately absent: Android flows read them.
+tool_read_denied_paths[8]{glob,note}:
+  "~/.secrets/**",owner secret files
+  "~/.ssh/**",ssh keys
+  "~/.aws/**",aws credentials
+  "~/.config/gcloud/**",gcloud credentials
+  "~/.netrc",credential file
+  "**/*.pem",private key or certificate
+  "**/id_rsa*",ssh private key
+  "**/id_ed25519*",ssh private key
+
+# Paths the agent may not write (design D1 self_protect). Enforced in every mode.
+self_protect_paths[7]{glob,note}:
+  "~/.claude/hooks/**",the hook and its policy
+  "~/.claude/settings**.json",claude settings (a single * matches exactly one char in glob_match)
+  "~/.claude/bin/claude-retention",retention script
+  "~/claude-backups/**",backups
+  "~/claude-backups",backups root
+  "~/.local/state/claude-hooks/**",hook state dir and parsed-policy cache
+  "~/.local/state/claude-hooks",hook state root
 
 # Read-only commands that are only allowed when they stay inside the home
 # .claude directory (the session memory, plan and prompt store).
@@ -249,7 +292,9 @@ git_write_flags[8]{flag,note}:
 
 # Commands that reach a remote host, a container runtime or the network.
 # Denied with `deny_reason` regardless of how they are chained.
-bash_denied[23]{argv0,category,note}:
+bash_denied[25]{argv0,category,note}:
+  gradle,local-build,Gradle builds run on the Dokploy builder only
+  gradlew,local-build,Gradle wrapper builds run on the Dokploy builder only
   ssh,remote,ssh to any host
   ssh-add,remote,load an ssh key
   scp,remote,copy to or from a remote host
@@ -303,6 +348,13 @@ bash_denied_extra[7]{argv0,category,note}:
   exec,smuggle,exec replaces the shell with argv0
   watch,smuggle,watch re-invokes argv0
 
+# ssh invocations whose WHOLE command line matches one of these regexes are
+# allowed even though `ssh` is in `bash_denied`, provided the command carries
+# no compound operators. Patterns use re.fullmatch, so each one must spell out
+# the whole intended command. A shell operator anywhere in the line, or in the
+# ssh payload, refuses the allow (bash.denied.ssh_compound). Empty since D4.
+ssh_allowed[0]{pattern,note}:
+
 # Wrappers that only put a bound around exactly one command, so the command
 # they wrap is still fully classified. `timeout 30 git status` is git status
 # with a deadline. These are peeled rather than denied, unlike the smuggle
@@ -321,7 +373,7 @@ shell_wrapper_value_flags[4]{flag,note}:
 # A LAN address, a loopback address or a known fleet hostname appearing in a
 # segment that is not itself an allowed capability is a remote reach.
 lan_address_re[1]{pattern}:
-  "(^|[^0-9a-zA-Z._-])(10\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}|192\\.168\\.[0-9]{1,3}\\.[0-9]{1,3}|172\\.(1[6-9]|2[0-9]|3[01])\\.[0-9]{1,3}\\.[0-9]{1,3}|169\\.254\\.[0-9]{1,3}\\.[0-9]{1,3}|127\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}|localhost|host\\.docker\\.internal|zeroclaw[0-9]*|zeroclaw-host)([^0-9a-zA-Z._-]|$)"
+  "(^|[^0-9a-zA-Z._-])(10\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}|192\\.168\\.[0-9]{1,3}\\.[0-9]{1,3}|172\\.(1[6-9]|2[0-9]|3[01])\\.[0-9]{1,3}\\.[0-9]{1,3}|169\\.254\\.[0-9]{1,3}\\.[0-9]{1,3}|127\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}|localhost|host\\.docker\\.internal|worker-host)([^0-9a-zA-Z._-]|$)"
 
 # ============================================================================
 # Native Claude Code tools. `decision` is allow, deny or ask.
@@ -369,13 +421,16 @@ write_tools[4]{name,note}:
 
 # The only paths Write/Edit/MultiEdit/NotebookEdit may touch. Anything outside
 # these globs is denied: the L1 session plans, it does not implement.
-write_allowed_paths[6]{glob,note}:
+write_allowed_paths[9]{glob,note}:
   "~/.claude/memory/**",session memory
   "~/.claude/plans/**",plans and briefs
   "~/.claude/prompts/**",prompt drafts
   "**/.claude/memory/**",repo local session memory
   "**/.claude/plans/**",repo local plans
   "**/.claude/prompts/**",repo local prompt drafts
+  "/tmp/**",scratch space
+  "/private/tmp/**",scratch space (macOS)
+  "/private/var/folders/**",per-user temp (macOS)
 
 # Path fields a write-like tool may carry, most specific first.
 write_path_keys[6]{key,note}:

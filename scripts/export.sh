@@ -4,7 +4,7 @@
 set -euo pipefail
 SRC="${CLAUDE_DIR:-$HOME/.claude}"; BIN="${BIN_DIR:-$HOME/.local/bin}"
 OUT="$(cd "$(dirname "$0")/.." && pwd)"
-copy() { mkdir -p "$OUT/$(dirname "$2")"; cp "$1" "$OUT/$2"; }
+copy() { [ -e "$1" ] || { echo "warn: missing $1, skipped" >&2; return 0; }; mkdir -p "$OUT/$(dirname "$2")"; cp "$1" "$OUT/$2"; }
 
 copy "$SRC/CLAUDE.md"                     CLAUDE.md
 copy "$SRC/settings.json"                 settings.example.json
@@ -23,9 +23,12 @@ find "$OUT" -type f ! -path '*/.git/*' ! -path '*/scripts/*' ! -name README.md !
     s#\Q$PRIV_USER\E@\Q$PRIV_HOST\E#worker\@zeroclaw-host#g;
     s#\Q$PRIV_HOST\E#zeroclaw-host#g;
     s#\b\Q$PRIV_HOME_USER\E\b#you#g;
+    s#v\\x63alvi#you#g;
     s#\b\Q$PRIV_USER\E\b#worker#g;
     s#\b192\.168\.\d+\.\d+\b#192.0.2.10#g;
   "
+find "$OUT" -type f ! -path '*/.git/*' ! -path '*/scripts/*' ! -name README.md ! -name LICENSE -print0 |
+  xargs -0 perl -pi -e 's/(Recorded verbatim from run\s+)\b\d{8}T\d{6}Z\b/$1<run-id>/g'
 # PRIV_MAP: extra "private=placeholder" pairs (host aliases, container names, git remotes).
 for pair in ${PRIV_MAP:-}; do
   from="${pair%%=*}" to="${pair#*=}"
@@ -38,6 +41,22 @@ p=sys.argv[1]; s=json.load(open(p))
 for k in ("voice","voiceEnabled","pluginConfigs","extraKnownMarketplaces","enabledPlugins","skipDangerousModePermissionPrompt"):
     s.pop(k,None)
 s.get("env",{}).pop("CLAUDE_CODE_PLUGIN_DIRS",None)
+def strip(o,inplug=False):
+    if isinstance(o,dict):
+        for k in list(o):
+            kl=k.lower(); ip=inplug or "plugin" in kl or "marketplace" in kl
+            if k=="path" and ip and isinstance(o[k],str) and o[k].startswith(("/","$HOME","~")): del o[k]
+            else: strip(o[k],ip)
+    elif isinstance(o,list):
+        for i in o: strip(i,inplug)
+strip(s)
+def drop(o):
+    if isinstance(o,dict):
+        for v in o.values(): drop(v)
+    elif isinstance(o,list):
+        o[:]=[x for x in o if not (isinstance(x,str) and "postspread" in x.lower())]
+        for x in o: drop(x)
+drop(s)
 json.dump(s,open(p,"w"),indent=2); open(p,"a").write("\n")
 PY
 echo "exported to $OUT"

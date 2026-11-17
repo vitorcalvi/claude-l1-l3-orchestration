@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # remote-worker (rq-new) — Mac-side dispatcher for the RQ-backed Tier-3
 # runner.  This is the staged replacement for the live remote-worker.
-# It talks to the staged `remote-dispatch.py.rq-new` on zeroclaw-host
+# It talks to the staged `remote-dispatch.py.rq-new` on worker-host
 # over SSH and adds:
 #   * `submit --priority high|normal|low` (default normal)
 #   * capacity guard derived from dispatcher list_jobs summary + slots
@@ -27,8 +27,8 @@
 main() {
 set -euo pipefail
 
-readonly SSH_HOST="zeroclaw-host"
-readonly DISPATCH_HOST="dispatch-host"
+readonly SSH_HOST="worker-host"
+readonly DISPATCH_HOST="worker-host-dispatch"
 readonly CONTAINER="agent-runner"
 readonly REMOTE_HOME='~/agent-work'
 readonly REMOTE_REPO_DIR="${REMOTE_HOME}/repos"
@@ -164,11 +164,11 @@ Usage: remote-worker <command> [args...]
 
 Commands:
   init <repo-path>
-      Provision the bare repo on zeroclaw-host and ensure the `worker-remote`
+      Provision the bare repo on worker-host and ensure the `worker-remote`
       git remote is configured on <repo-path>.
 
   run [--read-only] <repo-path> <base-branch> <qwen> <brief-file> [test-cmd]
-      Dispatch a job to zeroclaw-host. --read-only marks no-change
+      Dispatch a job to worker-host. --read-only marks no-change
       success as DONE and any worker commit as BLOCKED.  Prints the
       10-line envelope; exit 0 only for DONE.
 
@@ -229,7 +229,7 @@ Commands:
 
   gc [--days N] [--dry-run]
       Unchanged from the live wrapper.  Garbage-collect stale state on
-      zeroclaw-host; --days default 3.
+      worker-host; --days default 3.
 
   -h, --help
       Show this help and exit.

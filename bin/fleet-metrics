@@ -4,7 +4,7 @@
 One stdlib-only read-only command (python3, no third-party imports, no network)
 that joins the two halves of the l1opt cost story:
 
-    fleet-metrics [--since 7d] [--claude-dir DIR] [--zc-ledger FILE] [--top N]
+    fleet-metrics [--since 7d] [--claude-dir DIR] [--ledger FILE] [--top N]
 
     L1  Claude Code transcripts under --claude-dir (~/.claude/projects).
         Every *.jsonl record whose `message.role` (or `type`) is `assistant`
@@ -16,7 +16,7 @@ that joins the two halves of the l1opt cost story:
         requestId, then the record uuid) and the largest usage seen per message
         is kept: one assistant message is one turn, counted once.
 
-    L3  The ZeroClaw job ledger --zc-ledger ($WORK_ROOT/metrics/jobs.jsonl by
+    L3  The remote-worker job ledger --ledger ($WORK_ROOT/metrics/jobs.jsonl by
         default), the exact record run-job.sh appends and server-bin/zc-metrics.py
         reads: job_id, lane, model, fallback_of, start, end, latency_ms,
         llm_calls, tool_calls, tools, tokens_in, tokens_out, cost_usd,
@@ -523,15 +523,15 @@ def build_parser() -> argparse.ArgumentParser:
         prog="fleet-metrics",
         description="Per-task token and cost baseline in TOON: L1 Claude Code "
                     "sessions (fresh/cache/output tokens, turns) and L3 "
-                    "ZeroClaw lanes (jobs, retries, cost, p50 latency).",
+                    "remote-worker lanes (jobs, retries, cost, p50 latency).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=("examples:\n"
                 "  fleet-metrics --since 7d\n"
                 "  fleet-metrics --since 24h --top 20\n"
                 "  fleet-metrics --claude-dir ./claude-projects "
-                "--zc-ledger ./metrics/jobs.jsonl\n"
+                "--ledger ./metrics/jobs.jsonl\n"
                 "\n"
-                "A missing --claude-dir or --zc-ledger is reported as "
+                "A missing --claude-dir or --ledger is reported as "
                 "`unknown` in the totals with an empty table; the exit code "
                 "is still 0.\n"),
     )
@@ -543,8 +543,8 @@ def build_parser() -> argparse.ArgumentParser:
                              "<session>.jsonl transcripts "
                              "(default: $CLAUDE_CONFIG_DIR/projects, else "
                              "~/.claude/projects)")
-    parser.add_argument("--zc-ledger", default=None, metavar="FILE",
-                        help="ZeroClaw job ledger "
+    parser.add_argument("--ledger", "--zc-ledger", dest="ledger", default=None, metavar="FILE",
+                        help="remote-worker job ledger "
                              "(default: $ZC_METRICS_FILE, else "
                              "$WORK_ROOT/metrics/jobs.jsonl, else "
                              "/work/metrics/jobs.jsonl)")
@@ -571,7 +571,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     claude_dir = Path(os.path.expanduser(
         args.claude_dir if args.claude_dir is not None else default_claude_dir()))
     ledger = Path(os.path.expanduser(
-        args.zc_ledger if args.zc_ledger is not None else default_ledger()))
+        args.ledger if args.ledger is not None else default_ledger()))
     cutoff = None if window is None else time.time() - window * 3600.0
 
     # Neither half can fail the command: a broken source is `unknown`, not an

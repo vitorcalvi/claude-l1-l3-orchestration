@@ -172,7 +172,7 @@ dispatch_selftest_lane_health() {
   local qwen_prose="$dir/qwen-prose.json" codex_prose="$dir/codex-prose.txt" agy_prose="$dir/agy-prose.txt"
   local echo_msg="$dir/template-echo.txt" valid="$dir/valid.txt" reviewer_cfg="$dir/reviewer-worker"
   mkdir -p "$dir"
-  # Recorded verbatim from run 20261006T072340Z-e52f54 (agy lane).
+  # Recorded verbatim from run <run-id>-e52f54 (agy lane).
   cat > "$agy_quota" <<'FIXTURE'
 error: Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 21h7m54s.
 AGY_ERROR: {"short_error":"RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 21h7m54s.","status":"RESOURCE_EXHAUSTED","error_code":429,"code_kind":"http","retryable":true}
@@ -181,7 +181,7 @@ FIXTURE
   cat > "$codex_limit" <<'FIXTURE'
 ERROR: You have hit your usage limit. Try again later or check your plan and billing details.
 FIXTURE
-  # Recorded verbatim from run 20261006T071121Z (LiteLLM rate-limit fault the
+  # Recorded verbatim from run <run-id> (LiteLLM rate-limit fault the
   # qwen CLI printed on its own stderr). The numeric 429 is carried inside the
   # provider error object; no retry-after field or header is present, so the
   # detector must report the reason with an empty hint and let the TTL apply.
@@ -985,6 +985,8 @@ Usage: $PROG <claude|qwen|codex|agy|verify|review-loop> <delta.md> [--repo PATH]
   claude|qwen|codex|agy|verify|review-loop  Which orchestrator / verifier / loop to run.
   <delta.md>        Goal delta file with required ## sections.
   --repo PATH       Repository cwd for claude/qwen/codex (defaults to home).
+  --base BRANCH     Branch the remote worker starts from (overrides ## remote_base; remote only).
+  --ref SHA|BRANCH  Verify that ref in a temporary detached worktree (verify only).
   --model SLUG      Model override for agy/verify/qwen.
   --rounds N        Review-loop round limit (default 3, max 3).
   --dry-run         Render prompt.md, copy delta.md, and exit 0.
@@ -1024,6 +1026,30 @@ Required ## sections in <delta.md>:
 USAGE
 }
 err() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+
+# Remote repo + base sync for remote-worker lanes.
+# - repo name: from the `worker-remote` remote URL (worktree-safe; a worktree folder name is not the pool repo name)
+# - base: push the local base branch to worker-remote first, otherwise the lane silently starts from a stale ref.
+#   Non-force push; if worker-remote has diverged, BLOCK (SWARM_ALLOW_STALE_BASE=1 to override).
+worker-remote_git_dir() {  # $1 = REPO; prints a git work tree to use for worker-remote ops ($REPO, else the cwd's repo), or nothing
+  if git -C "$1" rev-parse --is-inside-work-tree >/dev/null 2>&1; then printf '%s\n' "$1"; return 0; fi
+  git rev-parse --show-toplevel 2>/dev/null || true
+}
+worker-remote_repo_name() {
+  local u; u="$(git -C "$1" remote get-url worker-remote 2>/dev/null)" || return 1
+  u="${u%/}"; u="${u##*/}"; printf '%s\n' "${u%.git}"
+}
+worker-remote_sync_base() {  # $1 repo dir, $2 base branch; logs to stdout
+  local repo="$1" base="$2"
+  git -C "$repo" remote get-url worker-remote >/dev/null 2>&1 || { printf 'REMOTE_BASE_SYNC=skip (no worker-remote remote)\n'; return 0; }
+  git -C "$repo" show-ref --verify --quiet "refs/heads/$base" || { printf 'REMOTE_BASE_SYNC=skip (no local branch %s)\n' "$base"; return 0; }
+  if git -C "$repo" push --quiet worker-remote "refs/heads/$base:refs/heads/$base" 2>/dev/null; then
+    printf 'REMOTE_BASE_SYNC=ok base=%s sha=%s\n' "$base" "$(git -C "$repo" rev-parse --short "$base")"; return 0
+  fi
+  printf 'REMOTE_BASE_SYNC=failed base=%s (worker-remote diverged or unreachable)\n' "$base"
+  [ "${SWARM_ALLOW_STALE_BASE:-0}" = 1 ] && return 0
+  return 1
+}
 bash3_compat_guard() {
   python3 - "$0" "$HOME/.local/bin/remote-worker" <<'PYGUARD'
 import pathlib, re, sys
@@ -1942,9 +1968,13 @@ REPORT_MODE=0
 LOCAL=0
 VERIFY_ON_PASS=0
 ROUNDS=3
+BASE_OVERRIDE=""
+REF=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --repo)  REPO="${2:-}"; REPO_SOURCE=explicit; shift 2 ;;
+    --base)  [ -n "${2:-}" ] || { err "--base requires a branch"; exit 64; }; BASE_OVERRIDE="$2"; REMOTE=1; shift 2 ;;
+    --ref)   [ -n "${2:-}" ] || { err "--ref requires a value"; exit 64; }; REF="$2"; shift 2 ;;
     --model) MODEL="${2:-}"; shift 2 ;;
     --rounds) ROUNDS="${2:-3}"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
@@ -2476,10 +2506,18 @@ os.replace(tmp, path)
 PYSYNC
 }
 remote_worker_bin="${DISPATCH_REMOTE_WORKER_BIN:-$HOME/.local/bin/remote-worker}"
+# Run a command with a hard deadline (DISPATCH_PROBE_TIMEOUT, default 2s) and kill its
+# whole process group on expiry, so an orphaned ssh/sleep cannot hold the pipe open.
+probe_bounded() {
+  perl -e 'my $t = shift; my $pid = fork(); if (!$pid) { setpgrp(0, 0); exec @ARGV; exit 127 }
+    $SIG{ALRM} = sub { kill "TERM", -$pid; waitpid($pid, 0); exit 124 };
+    alarm $t; waitpid($pid, 0); exit($? >> 8)' "${DISPATCH_PROBE_TIMEOUT:-2}" "$@"
+}
 remote_slot_summary() {
   local slots jobs
-  slots="$("$remote_worker_bin" slots 2>/dev/null)" || return 1
-  jobs="$("$remote_worker_bin" list-jobs 2>/dev/null)" || return 1
+  # Bounded probes: an unreachable pool must fail in seconds, not hang (macOS has no timeout(1)).
+  slots="$(probe_bounded "$remote_worker_bin" slots 2>/dev/null)" || return 1
+  jobs="$(probe_bounded "$remote_worker_bin" list-jobs 2>/dev/null)" || return 1
   python3 - "$slots" "$jobs" <<'PY'
 import json, sys
 try:
@@ -2496,6 +2534,19 @@ try:
     print(f"active={active} capacity={cap} idle={max(0,cap-active)} qwen={qwen} claude={claude}")
 except Exception: sys.exit(1)
 PY
+}
+# One routing verdict shared by --dry-run and the real run (pure: reads KIND REMOTE
+# ASYNCHRONOUS EXECUTION_MODE IDLE, always returns 0).
+route_decision() {
+  if [ "$REMOTE" -ne 1 ]; then echo "ROUTE=LOCAL reason=remote_not_requested"; return 0; fi
+  case "$KIND" in
+    claude|qwen) echo "ROUTE=REMOTE reason=kind_$KIND"; return 0 ;;
+    codex) ;;
+    *) echo "ROUTE=LOCAL reason=kind_${KIND}_has_no_remote_path"; return 0 ;;
+  esac
+  if [ "${EXECUTION_MODE:-}" != remote ]; then echo "ROUTE=LOCAL reason=codex_execution_not_remote"; return 0; fi
+  if [ -z "${IDLE:-}" ] && [ "$ASYNCHRONOUS" -ne 1 ]; then echo "ROUTE=UNAVAILABLE reason=slot_check_failed"; return 0; fi
+  echo "ROUTE=REMOTE reason=codex_execution_remote"
 }
 infer_remote_priority() {
   local explicit haystack task_type
@@ -2534,7 +2585,7 @@ write_remote_brief() {
     printf '\n## constraints\n'; extract_section constraints
     printf '\n## exclusions\n'; extract_section non_goals
     printf '\n## evidence required\n'; extract_section evidence_required
-    # ZeroClaw lane (paid|bulk|coding|fast|reasoning|auto); the server reads ## lane from the brief.
+    # remote-worker lane (paid|bulk|coding|fast|reasoning|auto); the server reads ## lane from the brief.
     local lane; lane="$(extract_section lane | sed -n '1p' | tr -d '[:space:]')"
     if [ -n "$lane" ]; then printf '\n## lane\n%s\n' "$lane"; fi
     # Server flags, read the same way as ## lane: first non-empty line of the
@@ -2546,6 +2597,12 @@ write_remote_brief() {
     if [ "$allow_test_edits_flag" = yes ]; then printf '\n## allow_test_edits\nyes\n'; fi
     no_retry_flag="$(extract_section no_retry | awk 'NF{print; exit}' | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
     if [ "$no_retry_flag" = yes ]; then printf '\n## no_retry\nyes\n'; fi
+    # Explicit write manifest read by the server's zc-scope-check.py: it only accepts
+    # "- path" bullet lines under "## allowed_paths". Without it a new file is blocked
+    # (SCOPE_CHECK=FAIL mode=retry_frozen). Forward only the bullet lines; emit nothing when absent.
+    local allowed_paths_body
+    allowed_paths_body="$(extract_section allowed_paths | grep -E '^[[:space:]]*[-*] ' || true)"
+    if [ -n "$allowed_paths_body" ]; then printf '\n## allowed_paths\n%s\n' "$allowed_paths_body"; fi
   } > "$out"
 }
 
@@ -2567,9 +2624,11 @@ run_review_loop() {
 
   [ -n "$REPO" ] || REPO="$HOME"
   REMOTE_REPO="$(extract_section remote_repo | sed -n '1p' | tr -d '[:space:]')"
-  [ -n "$REMOTE_REPO" ] || REMOTE_REPO="$(basename "$REPO")"
+  [ -n "$REMOTE_REPO" ] || REMOTE_REPO="$(worker-remote_repo_name "$(worker-remote_git_dir "$REPO")" || basename "$REPO")"
   REMOTE_BASE="$(extract_section remote_base | sed -n '1p' | tr -d '[:space:]')"
+  [ -z "$BASE_OVERRIDE" ] || REMOTE_BASE="$BASE_OVERRIDE"
   [ -n "$REMOTE_BASE" ] || REMOTE_BASE="$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || printf main)"
+  if [ "$DRY_RUN" != 1 ]; then worker-remote_sync_base "$(worker-remote_git_dir "$REPO")" "$REMOTE_BASE" || { err "base branch $REMOTE_BASE not on worker-remote; push failed (SWARM_ALLOW_STALE_BASE=1 to override)"; exit 3; }; fi
   REMOTE_TEST="$(extract_section remote_test_cmd | sed -n '1p' | tr -d '\r')"
   if [ -z "$REMOTE_TEST" ]; then
     # A delta with no pytest-shaped acceptance command leaves nothing to run, so
@@ -3711,6 +3770,70 @@ case "$VERIFIER_WORKER" in
 esac
 [ -n "$VERIFIER_WORKER" ] || VERIFIER_WORKER="codex"
 
+# --base only reaches the remote worker. verify always runs locally against
+# $REPO's checkout, so accepting it there would report a branch it never inspected.
+if [ -n "$BASE_OVERRIDE" ] && { [ "$LOCAL" -eq 1 ] || [ "$KIND" = "verify" ]; }; then
+  err "--base needs the remote worker (claude|qwen|codex); verify runs locally, so pass --repo <worktree checked out on the branch>"
+  exit 64
+fi
+
+if [ -n "$REF" ] && [ "$KIND" != "verify" ]; then
+  err "--ref is only valid for verify"
+  exit 64
+fi
+
+# --ref: verify a pushed ref in a throwaway detached worktree, never the live checkout.
+if [ -n "$REF" ]; then
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf 'VERIFY_REF=%s (worktree planned, not created)\n' "$REF"
+  else
+    SRC=$(git -C "$REPO" rev-parse --show-toplevel) || {
+      err "cannot find git checkout: $REPO"
+      exit 66
+    }
+    # A fresh fetch wins over a possibly stale local branch of the same name.
+    if git -C "$SRC" fetch --quiet worker-remote "$REF" 2>/dev/null; then
+      SHA=$(git -C "$SRC" rev-parse --verify --quiet 'FETCH_HEAD^{commit}' || true)
+    else
+      SHA=$(git -C "$SRC" rev-parse --verify --quiet "$REF^{commit}" || true)
+    fi
+    if [ -z "$SHA" ]; then
+      err "cannot resolve ref $REF"
+      exit 66
+    fi
+    git -C "$SRC" worktree prune
+    VT=$(mktemp -d) || {
+      err "cannot create temporary directory"
+      exit 66
+    }
+    if ! git -C "$SRC" worktree add --detach --quiet "$VT/wt" "$SHA"; then
+      rm -rf "$VT"
+      err "cannot create verify worktree for $REF"
+      exit 66
+    fi
+    verify_ref_cleanup() {
+      git -C "$SRC" worktree remove --force "$VT/wt" >/dev/null 2>&1
+      rm -rf "$VT"
+    }
+    trap verify_ref_cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    # Traps wait for the foreground child and never run on SIGKILL: a detached janitor
+    # removes the worktree once this process is gone, whatever ended it.
+    # Double-forked so it is adopted by init and survives a kill of dispatch's whole tree.
+    ( ( DPID=$$; while kill -0 "$DPID" 2>/dev/null; do sleep 1; done
+        git -C "$SRC" worktree remove --force "$VT/wt" >/dev/null 2>&1; rm -rf "$VT" ) </dev/null >/dev/null 2>&1 & )
+    if [ -d "$SRC/node_modules" ]; then
+      ln -s "$SRC/node_modules" "$VT/wt/node_modules" || {
+        err "cannot link node_modules"
+        exit 66
+      }
+    fi
+    REPO="$VT/wt"
+    printf 'VERIFY_REF=%s SHA=%s WORKTREE=%s\n' "$REF" "$SHA" "$REPO"
+  fi
+fi
+
 if [ "$DRY_RUN" -eq 1 ]; then
   printf 'RUN_DIR=%s\nPROMPT=%s\nTEMPLATE=%s\n' "$RUN_DIR" "$RUN_DIR/prompt.md" "$TEMPLATE"
   if [ "$KIND" = "claude" ] || [ "$KIND" = "qwen" ] || [ "$KIND" = "codex" ] || { [ "$KIND" = "verify" ] && [ "$VERIFIER_WORKER" != agy ]; }; then
@@ -3730,6 +3853,9 @@ if [ "$DRY_RUN" -eq 1 ]; then
       printf 'REMOTE_SLOT_CHECK=%s\n' "${SLOT_SUMMARY:-unavailable}"
       printf 'REMOTE_SUBMIT=skipped (dry-run)\n'
     fi
+    EXECUTION_MODE="$(sed -n 's/^## execution:[[:space:]]*//p' "$RUN_DIR/delta.md" | head -n 1)"
+    IDLE="$(printf '%s\n' "${SLOT_SUMMARY:-}" | sed -n 's/.*idle=\([0-9][0-9]*\).*/\1/p')"
+    route_decision
     if [ "$REMOTE" -eq 0 ]; then
       printf 'COMMAND: PAGER=cat codex exec -c model_reasoning_effort="%s" --output-schema "%s/output-schema.json" --dangerously-bypass-approvals-and-sandbox -C "%s" --ephemeral --output-last-message "%s/lastmsg.txt" "$(cat "%s/prompt.md")" < /dev/null > "%s/report.raw" 2>&1\n' \
         "$EFFORT" "$RUN_DIR" "$REPO" "$RUN_DIR" "$RUN_DIR" "$RUN_DIR"
@@ -3750,6 +3876,11 @@ if { [ "$KIND" = claude ] || [ "$KIND" = codex ] || [ "$KIND" = qwen ]; } && [ "
     SLOT_SUMMARY="$(remote_slot_summary 2>/dev/null || true)"
     printf 'REMOTE_SLOT_CHECK=%s\n' "${SLOT_SUMMARY:-unavailable}" | tee "$RUN_DIR/remote-routing.txt"
     IDLE="$(printf '%s\n' "$SLOT_SUMMARY" | sed -n 's/.*idle=\([0-9][0-9]*\).*/\1/p')"
+    ROUTE_LINE="$(route_decision)"
+    printf '%s\n' "$ROUTE_LINE" | tee -a "$RUN_DIR/remote-routing.txt" >&2
+    case "$ROUTE_LINE" in
+      ROUTE=UNAVAILABLE*) err "remote unavailable: ${ROUTE_LINE#*reason=}"; exit 30 ;;
+    esac
     # --async never falls back to a local worker: a submit that only hands back
     # a job id cannot block on pool capacity, and L1 must not start a local run.
     if [ -n "$IDLE" ] || [ "$KIND" = qwen ] || [ "$KIND" = claude ] || [ "$ASYNCHRONOUS" -eq 1 ]; then
@@ -3762,12 +3893,20 @@ if { [ "$KIND" = claude ] || [ "$KIND" = codex ] || [ "$KIND" = qwen ]; } && [ "
         REMOTE_REPO="$REPO"
         REMOTE_REPO_SOURCE=report
       else
-        REMOTE_REPO="$(basename "$REPO")"
+        REMOTE_REPO="$(worker-remote_repo_name "$(worker-remote_git_dir "$REPO")" || basename "$REPO")"
         REMOTE_REPO_SOURCE=derived
       fi
       REMOTE_BASE="$(extract_section remote_base | sed -n '1p' | tr -d '[:space:]')"
+      [ -z "$BASE_OVERRIDE" ] || REMOTE_BASE="$BASE_OVERRIDE"
       if [ -z "$REMOTE_BASE" ]; then
         REMOTE_BASE="$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || printf main)"
+      fi
+      if [ "${DRY_RUN:-0}" != 1 ] && ! worker-remote_sync_base "$(worker-remote_git_dir "$REPO")" "$REMOTE_BASE" | tee -a "$RUN_DIR/remote-routing.txt" | grep -q '=ok\|=skip'; then
+        if [ "${SWARM_ALLOW_STALE_BASE:-0}" != 1 ]; then
+          printf 'STATUS: BLOCKED\nFAILURE: base %s could not be pushed to worker-remote (lane would start from a stale ref)\n' "$REMOTE_BASE" > "$RUN_DIR/digest.md"
+          printf 'RUN_DIR=%s\nSTATUS=BLOCKED\n' "$RUN_DIR"
+          exit 3
+        fi
       fi
       # Normalize and validate remote worker type. Active default is Claude;
       # qwen remains accepted only as an explicit compatibility/repair route.
@@ -3942,9 +4081,31 @@ if isinstance(payload, dict) and isinstance(payload.get("job_id"), str):
         else
           RESULT_STATUS=BLOCKED
         fi
-        python3 - "$RESULT_JSON" "$LOG_JSON" "$RUN_DIR" "$RUN_ID" "$REMOTE_BASE" "$JOB_ID" "$RESULT_STATUS" <<'PYREMOTE'
+        # Editable jobs: report the job branch head and its changed paths (was hard-coded "none").
+        REMOTE_JOB_BRANCH="$(python3 -c 'import json,sys
+try:
+    d=json.load(open(sys.argv[1]))
+except Exception:
+    d={}
+for k in ("envelope","result","output"):
+    e=d.get(k) if isinstance(d,dict) else None
+    if isinstance(e,dict) and (e.get("BRANCH") or e.get("branch")):
+        print(e.get("BRANCH") or e.get("branch")); break
+else:
+    print((d.get("BRANCH") or d.get("branch") or "") if isinstance(d,dict) else "")' "$RUN_DIR/remote-result.json" 2>/dev/null || true)"
+        REMOTE_JOB_HEAD="" REMOTE_JOB_CHANGED=""
+        AB_DIR="$(worker-remote_git_dir "$REPO")"
+        if [ -n "$REMOTE_JOB_BRANCH" ] && [ "$REMOTE_JOB_BRANCH" != "$REMOTE_BASE" ] && [ -n "$AB_DIR" ]; then
+          REMOTE_JOB_HEAD="$(git -C "$AB_DIR" ls-remote worker-remote "refs/heads/$REMOTE_JOB_BRANCH" 2>/dev/null | awk '{print $1}' | head -1 || true)"
+          # Changed paths relative to the merge-base (three-dot), so a base branch that moved since submit
+          # (e.g. another lane merged) does not show up as this job's changes. Fetch into FETCH_HEAD only (no refs).
+          if git -C "$AB_DIR" fetch -q worker-remote "$REMOTE_JOB_BRANCH" 2>/dev/null; then
+            REMOTE_JOB_CHANGED="$(git -C "$AB_DIR" diff --name-only "$REMOTE_BASE...FETCH_HEAD" 2>/dev/null | tr '\n' ' ' | sed 's/ $//' || true)"
+          fi
+        fi
+        python3 - "$RESULT_JSON" "$LOG_JSON" "$RUN_DIR" "$RUN_ID" "$REMOTE_BASE" "$JOB_ID" "$RESULT_STATUS" "$REMOTE_JOB_BRANCH" "$REMOTE_JOB_HEAD" "$REMOTE_JOB_CHANGED" <<'PYREMOTE'
 import json, pathlib, re, sys
-payload, log_payload, run_dir, run_id, base, job_id, status = sys.argv[1:]
+payload, log_payload, run_dir, run_id, base, job_id, status, job_branch, job_head, job_changed = sys.argv[1:]
 data = json.loads(payload)
 result = data.get("result", data.get("envelope", data.get("output", data)))
 worker_result = data.get("worker_result")
@@ -4026,9 +4187,9 @@ lines = [
     "STATUS: " + status,
     "RUN_ID: " + run_id,
     "BASE: " + base,
-    "HEAD: none",
-    "CHANGED: none",
-    "ANSWER: Remote job " + job_id + " result: " + answer,
+    "HEAD: " + (job_head if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", job_head or "") else "none"),  # contract: full SHA or none
+    "CHANGED: " + (job_changed or "none"),
+    "ANSWER: Remote job " + job_id + ((" branch " + job_branch) if job_branch else "") + " result: " + answer,
 ]
 lines.extend("CHECKS: " + check for check in checks)
 lines.extend([
@@ -4073,9 +4234,10 @@ run_qwen_worker() {
   # written to disk. Model precedence:
   #   1) CLI --model override (explicit dispatch invocation)
   #   2) ## model section of the delta (optional override)
-  #   3) minimax-flash — the single MiniMax M3.1 Flash Preview alias. LiteLLM is
-  #      the source of truth and is the only provider path, so effort high and
-  #      `complex: true` deliberately no longer select a different model.
+  #   3) coding — the LiteLLM pool-coding alias (Sonnet/Sol medium -> Gemini
+  #      Flash -> Nemotron; MiniMax retired 2026-11-02). LiteLLM is the source of
+  #      truth and is the only provider path, so effort high and `complex: true`
+  #      deliberately no longer select a different model.
   QWEN_LITELLM_BASE_URL="${DISPATCH_QWEN_BASE_URL:-http://zeroclaw-host:4000/v1}"
   QWEN_LITELLM_KEY="${DISPATCH_QWEN_KEY:-$(security find-generic-password -a worker -s litellm-consumer -w 2>/dev/null || true)}"
   if [ -z "$QWEN_LITELLM_KEY" ]; then
@@ -4099,7 +4261,7 @@ run_qwen_worker() {
     fi
   fi
   if [ -z "$MODEL" ]; then
-    MODEL="minimax-flash"
+    MODEL="coding"
   fi
   printf '%s\n' "$MODEL" > "$RUN_DIR/qwen-model.txt"
   QWEN_ARGS=(--yolo --output-format json --max-wall-time "${QWEN_TIMEOUT_SECONDS}s" --model "$MODEL")
@@ -4172,15 +4334,15 @@ if [ "$KIND" = "codex" ] || { [ "$KIND" = "verify" ] && [ "$VERIFIER_WORKER" = c
   if [ "$KIND" = "verify" ] && { grep -Eiq 'you have hit your usage limit' "$REPORT_RAW" || { [ ! -s "$RUN_DIR/lastmsg.txt" ] && { grep -Eiq 'you have hit your usage limit' "$RUN_DIR/codex-exec.log" 2>/dev/null || grep -Eiq 'you have hit your usage limit' "$REPO/codex-exec.log" 2>/dev/null; }; }; }; then
     cp "$REPORT_RAW" "$RUN_DIR/codex.usage-limit.raw"
     printf 'VERIFIER_FALLBACK: qwen\n' > "$RUN_DIR/fallback.txt"
-    MODEL="minimax-flash"
+    MODEL="coding"
     run_qwen_worker
   fi
 elif [ "$KIND" = "qwen" ] || { [ "$KIND" = "verify" ] && [ "$VERIFIER_WORKER" = qwen ]; }; then
-  # Verify runs force the MiniMax alias explicitly (the same alias every other
+  # Verify runs force the coding alias explicitly (the same alias every other
   # qwen path now uses) because the generated verify delta carries no ## effort
   # or `complex: true` line to select it.
   if [ "$KIND" = verify ]; then
-    MODEL="minimax-flash"
+    MODEL="coding"
   fi
   run_qwen_worker
 else
@@ -4250,7 +4412,7 @@ if { [ "$KIND" = "agy" ] || { [ "$KIND" = "verify" ] && [ "$VERIFIER_WORKER" = a
   REPO="${REPO:-$HOME}"
   if [ "$FALLBACK_TARGET" = qwen ]; then
     printf 'FALLBACK_ROUTED: codex unavailable in lane-status -> qwen\n' >> "$RUN_DIR/fallback.txt"
-    MODEL="minimax-flash"
+    MODEL="coding"
     run_qwen_worker
   else
     if complex_task; then CODEX_TIMEOUT="$(policy_value timeouts_minutes.codex.complex 90)"; else CODEX_TIMEOUT="$(policy_value timeouts_minutes.codex.normal 45)"; fi

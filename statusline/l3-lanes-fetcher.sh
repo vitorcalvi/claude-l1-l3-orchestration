@@ -12,6 +12,11 @@ set -u
 
 CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 CACHE="$CLAUDE_DIR/l3-lanes-cache.json"
+_dl="$(dirname "$0")"
+for _f in "$_dl/bin/_deadline.sh" "$CLAUDE_DIR/bin/_deadline.sh" "$_dl/_deadline.sh"; do
+  [[ -f "$_f" ]] && { . "$_f"; break; }
+done
+command -v with_deadline >/dev/null 2>&1 || exit 0
 RW="${L3_REMOTE_WORKER:-$HOME/.local/bin/remote-worker}"
 
 [[ -x "$RW" ]] || exit 0
@@ -19,18 +24,7 @@ RW="${L3_REMOTE_WORKER:-$HOME/.local/bin/remote-worker}"
 tmp="$(mktemp "${CACHE}.XXXXXX")" || exit 0
 trap 'rm -f "$tmp" "$tmp.raw"' EXIT
 
-# Hard timeout without coreutils `timeout` (not on stock macOS).
-"$RW" slots >"$tmp.raw" 2>/dev/null &
-pid=$!
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-  kill -0 "$pid" 2>/dev/null || break
-  sleep 0.5
-done
-if kill -0 "$pid" 2>/dev/null; then
-  kill "$pid" 2>/dev/null
-  exit 0
-fi
-wait "$pid" || exit 0
+with_deadline 5 "$RW" slots >"$tmp.raw" 2>/dev/null || exit 0
 
 jq -c --argjson now "$(date +%s)" '
   select(.ok == true)

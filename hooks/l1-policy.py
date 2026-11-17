@@ -56,12 +56,10 @@ says out loud.  ``decide()`` is mode-free: it is the transport that differs.
 Standard library only.  No network access.
 """
 
-import argparse
 import json
 import os
 import re
 import sys
-import tempfile
 import time
 
 try:
@@ -98,6 +96,7 @@ REASON_CODES = {
     "bash.claude_home_read": ALLOW,
     "bash.read_any": ALLOW,
     "bash.compound_allowed": ALLOW,
+    "bash.ssh_allowed": ALLOW,
     "bash.empty": ALLOW,
     # Bash, denied
     "bash.denied.remote": DENY,
@@ -109,7 +108,9 @@ REASON_CODES = {
     "bash.denied.smuggle": DENY,
     "bash.denied.git_write": DENY,
     "bash.denied.unknown": DENY,
+    "bash.denied.git_force": DENY,
     "bash.denied.read_guard": DENY,
+    "bash.denied.redirect_write": DENY,
     "bash.denied.lan_address": DENY,
     # Write / Edit
     "write.allowed_path": ALLOW,
@@ -127,6 +128,8 @@ REASON_CODES = {
     "budget.ask": ASK,
     "override.allow": ALLOW,
     "input.empty": ALLOW,
+    "tool.denied.read_guard": DENY,
+    "error.failclosed": DENY,
     "input.unreadable": ASK,
     "input.other_event": ALLOW,
     "error.internal": ASK,
@@ -596,6 +599,18 @@ def _int_scalar(doc, key, default):
         return default
 
 
+def _bool_scalar(doc, key, default):
+    raw = doc["scalars"].get(key)
+    if raw is None:
+        return default
+    val = str(raw).strip().lower()
+    if val in ("true", "1", "yes", "on"):
+        return True
+    if val in ("false", "0", "no", "off"):
+        return False
+    return default
+
+
 # ---------------------------------------------------------------------------
 # mode selection
 # ---------------------------------------------------------------------------
@@ -646,6 +661,8 @@ class Policy(object):
         self.mode = normalise_mode(scalars.get("mode"))
         self.shadow_audit_log = (scalars.get("shadow.audit_log")
                                   or DEFAULT_SHADOW_AUDIT_LOG)
+        self.shadow_log_allow = _bool_scalar(doc, "shadow.log_allow", True)
+        self.shadow_max_bytes = max(0, _int_scalar(doc, "shadow.max_bytes", 0))
         self.budget_soft_limit = max(0, _int_scalar(doc, "budget.soft_limit", 40))
         self.budget_ask_multiplier = max(1, _int_scalar(doc, "budget.ask_multiplier", 2))
 
@@ -746,6 +763,31 @@ class Policy(object):
             except re.error:
                 self.lan_pattern = None
 
+        # ssh invocations whose WHOLE command line matches one of these
+        # compiled regexes are allowed before the per-segment classifier
+        # denies `ssh` as remote, provided the command carries no compound
+        # operators. See policy.toon `ssh_allowed`.
+        self.ssh_allowed = []
+        for row in _table_rows(doc, "ssh_allowed"):
+            pattern = (row.get("pattern") or "").strip()
+            if not pattern:
+                continue
+            try:
+                self.ssh_allowed.append(re.compile(pattern))
+            except re.error:
+                pass
+
+        # Reason-code prefixes that stay enforced even while the global
+        # mode is shadow. A deny whose `[reason_code=...]` starts with any
+        # of these prefixes is emitted on stdout (as enforce) instead of
+        # being shadow-logged.
+        enforce_raw = (scalars.get("enforce_reason_prefixes") or "").strip()
+        self.enforce_reason_prefixes = [
+            part.strip()
+            for part in enforce_raw.split(",")
+            if part.strip()
+        ]
+
         self.tools = {}
         for row in _table_rows(doc, "tools"):
             name = (row.get("name") or "").strip()
@@ -776,6 +818,18 @@ class Policy(object):
             if name:
                 self.mcp_tools[name.lower()] = (row.get("decision") or ASK).lower()
 
+        self.tool_read_denied_paths = [
+            (row.get("glob") or "").strip()
+            for row in _table_rows(doc, "tool_read_denied_paths")
+            if (row.get("glob") or "").strip()]
+        self.self_protect_paths = [
+            (row.get("glob") or "").strip()
+            for row in _table_rows(doc, "self_protect_paths")
+            if (row.get("glob") or "").strip()]
+
+        self.locked_reason_prefixes = [
+            x.strip() for x in (scalars.get("locked_reason_prefixes") or "").split(",")
+            if x.strip()]
         self.override_env_var = scalars.get("override.env_var") or "L1_POLICY_OVERRIDE"
         self.override_audit_log = scalars.get("override.audit_log") or "override-audit.jsonl"
 
@@ -802,12 +856,110 @@ def default_policy_path():
     return os.path.join(here, POLICY_BASENAME)
 
 
-def load_policy(path=None):
-    """Load and type policy.toon. `path` defaults to the file next to this script."""
+CACHE_BASENAME = "policy-cache.json"
+CACHE_SCHEMA = 1
+
+
+def _policy_fingerprint(path):
+    """(key dict, text) for the policy file: path, mtime_ns, size and sha256."""
+    import hashlib  # lazy: only needed when a cache is in play
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    st = os.stat(path)
+    key = {"schema": CACHE_SCHEMA, "path": os.path.abspath(path),
+           "mtime_ns": st.st_mtime_ns, "size": st.st_size,
+           "sha256": hashlib.sha256(raw).hexdigest()}
+    return key, raw.decode("utf-8")
+
+
+def _read_cache(cache_path, key):
+    """Return the cached parsed doc when it matches `key`, else None."""
+    try:
+        with open(cache_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        doc = data["doc"]
+        if data["key"] == key and isinstance(doc, dict) and "scalars" in doc and "tables" in doc:
+            return doc
+    except Exception:  # noqa: BLE001 - corrupt or mismatched cache is just a miss
+        pass
+    return None
+
+
+def _write_cache(cache_path, key, doc):
+    tmp = "%s.%d.tmp" % (cache_path, os.getpid())
+    try:
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"key": key, "doc": doc}, fh)
+        os.replace(tmp, cache_path)
+    except (IOError, OSError):
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def load_policy(path=None, cache_dir=None):
+    """Load and type policy.toon. `path` defaults to the file next to this script.
+
+    With `cache_dir` the parsed document is cached as JSON there and reused
+    while the policy's path, mtime_ns, size and sha256 are unchanged.  Any
+    cache problem falls back to parsing policy.toon.
+    """
     path = path or default_policy_path()
-    with open(path, "r", encoding="utf-8") as fh:
-        text = fh.read()
-    return Policy(parse_toon(text), path)
+    if not cache_dir:
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+        return Policy(parse_toon(text), path)
+    key, text = _policy_fingerprint(path)
+    cache_path = os.path.join(cache_dir, CACHE_BASENAME)
+    doc = _read_cache(cache_path, key)
+    if doc is None:
+        doc = parse_toon(text)
+        _write_cache(cache_path, key, doc)
+    return Policy(doc, path)
+
+
+# Tools the harness polls constantly. In enforce mode with no override they
+# are allowed without loading the policy (policy.toon lists both as allow and
+# as budget-exempt). Shadow mode still logs, which needs the policy.
+FAST_SAFE_TOOLS = frozenset(("ListAgents", "ToolSearch"))
+
+
+def _fast_safe_allow(env):
+    """Handle a safe-set stdin call before any policy load; True when done."""
+    if env.get("L1_POLICY_OVERRIDE") or env.get("L1_TEST_RAISE") == "1":
+        return False
+    mode = (env.get(MODE_ENV_VAR) or "").strip().lower()
+    if mode != ENFORCE:
+        return False
+    try:
+        raw = sys.stdin.read()
+        payload = json.loads(raw)
+    except Exception:  # noqa: BLE001
+        return False
+    if not isinstance(payload, dict):
+        return False
+    tool = payload.get("tool_name") or payload.get("toolName") or ""
+    event = payload.get("hook_event_name") or payload.get("hookEventName") or "PreToolUse"
+    if tool not in FAST_SAFE_TOOLS or event != "PreToolUse":
+        # hand the already-read payload back to the slow path
+        sys.stdin = _ReplayStdin(raw)
+        return False
+    sys.stdout.write(json.dumps(render(
+        ALLOW, "allow: tool '%s' is allowed." % tool, "tool.allow")) + "\n")
+    return True
+
+
+class _ReplayStdin(object):
+    def __init__(self, text):
+        self._text = text
+
+    def read(self):
+        return self._text
+
+    def isatty(self):
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -892,6 +1044,369 @@ def path_is_allowed(path, policy):
 
 
 # ---------------------------------------------------------------------------
+# fail closed, break-glass, locked codes (D2, D3)
+# ---------------------------------------------------------------------------
+
+SAFE_TOOLS = frozenset(("TaskCreate", "TaskUpdate", "TaskList", "TaskGet",
+                        "ToolSearch", "AskUserQuestion", "ListAgents"))
+READ_TOOLS = frozenset(("Read", "Grep", "Glob"))
+GUARDED_TOOLS = READ_TOOLS | frozenset(("Edit", "Write", "MultiEdit", "NotebookEdit"))
+# Directories (under $HOME) and files the fail-closed table always protects.
+SECRET_DIRS = (".secrets", ".ssh", ".aws", os.path.join(".config", "gcloud"))
+SECRET_FILES = (".netrc",)
+# Codes no override and no shadow mode may lift (design D1/D2/D3).
+LOCKED_CODE_PREFIXES = ("tool.denied.read_guard", "tool.denied.self_protect",
+                        "bash.denied.remote_destructive", "bash.denied.ssh_compound",
+                        "error.")
+_BREAKGLASS_TAIL = r"/claude-backups/pre-fix-[0-9T]+/restore\.sh"
+
+
+def is_locked_code(code, extra=()):
+    code = code or ""
+    return any(code.startswith(prefix) for prefix in tuple(LOCKED_CODE_PREFIXES) + tuple(extra))
+
+
+def _secret_roots(env):
+    home = _home(env)
+    if not home:
+        return []
+    home = os.path.normpath(home)
+    roots = [os.path.join(home, d) for d in SECRET_DIRS]
+    roots += [os.path.join(home, f) for f in SECRET_FILES]
+    return roots
+
+
+def _resolve(path):
+    """realpath of the path, or of its nearest existing parent plus the tail."""
+    path = os.path.normpath(path)
+    tail = []
+    probe = path
+    while probe and not os.path.lexists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        tail.insert(0, os.path.basename(probe))
+        probe = parent
+    return os.path.normpath(os.path.join(os.path.realpath(probe), *tail))
+
+
+def _expand_glob(pattern, env):
+    home = _home(env) or ""
+    if pattern == "~":
+        return home
+    if pattern.startswith("~/"):
+        return os.path.join(home, pattern[2:])
+    return pattern
+
+
+def _glob_root(expanded):
+    """Literal directory prefix of a glob (everything before the first wildcard)."""
+    cut = len(expanded)
+    for ch in "*?[":
+        idx = expanded.find(ch)
+        if idx != -1:
+            cut = min(cut, idx)
+    prefix = expanded[:cut]
+    if cut < len(expanded):
+        prefix = prefix.rsplit("/", 1)[0]
+    return prefix.rstrip("/")
+
+
+def _path_variants(raw, cwd, env):
+    """Lexical and realpath forms of a tool path, `$HOME` and `~` expanded."""
+    text = raw.strip()
+    home = _home(env) or ""
+    if home:
+        text = text.replace("${HOME}", home).replace("$HOME", home)
+    norm = normalise_path(text, cwd, env)
+    if not norm:
+        return []
+    out = [norm]
+    real = _resolve(norm)
+    if real != norm:
+        out.append(real)
+    return out
+
+
+def _globs_hit(globs, variant, env, ancestors=False):
+    for pattern in globs:
+        expanded = _expand_glob(pattern, env)
+        root = _glob_root(expanded)
+        for form in set((expanded, root + "/**" if root and expanded.endswith("/**") else expanded)):
+            if glob_match(form, variant):
+                return pattern
+        # A bare directory only counts for a recursive glob (`dir/**`) or a literal path;
+        # `settings**.json` does not protect the directory that merely holds it.
+        if root and variant == root and (expanded.endswith("/**") or root == expanded):
+            return pattern
+        if ancestors and root and under(root, variant):
+            return pattern
+        if ancestors and root and root != expanded:
+            real_root = _resolve(root)
+            if real_root != root and (under(variant, real_root) or under(real_root, variant)):
+                return pattern
+    return None
+
+
+def tool_path_hit(tool, tool_input, policy, cwd, env):
+    """read_guard: policy-listed secret globs, after ~/$HOME expansion and realpath."""
+    if tool not in GUARDED_TOOLS or not isinstance(tool_input, dict):
+        return None
+    cwd = cwd or os.getcwd()
+    searching = tool in ("Grep", "Glob")
+    candidates = []
+    for key in ("file_path", "path", "notebook_path"):
+        if isinstance(tool_input.get(key), str):
+            candidates.append(tool_input[key])
+    if searching and not isinstance(tool_input.get("path"), str):
+        candidates.append(cwd)
+    if searching:
+        for key in ("pattern", "glob"):
+            value = tool_input.get(key)
+            if isinstance(value, str) and value.startswith(("~", "$HOME", "${HOME}", "/")):
+                candidates.append(value)
+    for raw in candidates:
+        for variant in _path_variants(raw, cwd, env):
+            hit = _globs_hit(policy.tool_read_denied_paths, variant, env, ancestors=searching)
+            if hit:
+                return "%s touches protected path %s (matches %s)" % (tool, variant, hit)
+    return None
+
+
+SELF_PROTECT_TOOLS = frozenset(("Write", "Edit", "MultiEdit", "NotebookEdit"))
+WRITE_VERB_RE = re.compile(
+    r"(?:^|[\s;&|(`])(?:tee|cp|mv|rm|ln|chmod|chown|truncate|install|dd|rsync|sed\s+-[A-Za-z]*i"
+    r"|perl\s+-[A-Za-z]*i|python3?\s+-c|node\s+-e)(?=[\s;&|)`]|$)|>")
+
+
+def _state_dir_hit(variant, env):
+    """The resolved hook state dir (parsed-policy cache) is read-only to the agent."""
+    state = resolve_state_dir(env)
+    for root in set((state, _resolve(state))):
+        if under(variant, root):
+            return "state dir " + root
+    return None
+
+
+_PAYLOAD_WRITE_RE = re.compile(
+    r"""['"][wax][bt+]*['"]|\.write|writeFile|appendFile|createWriteStream|unlink|rmtree"""
+    r"""|rename|\bremove\b|copyfile|\bmove\b|\bcopy\b|os\.system|subprocess|""" + WRITE_VERB_RE.pattern)
+_PATH_TOKEN_RE = re.compile(r"""[^\s;&|()<>=\"'`,]+""")
+_COMMAND_PREFIXES = frozenset(("sudo", "env", "command", "nohup", "time", "exec", "doas",
+                               "nice", "ionice", "timeout", "xargs", "busybox"))
+_INTERP_INLINE = {"python3": "-c", "python": "-c", "node": "-e", "bash": "-c", "sh": "-c",
+                  "zsh": "-c", "dash": "-c"}
+
+
+def _protected_hit(tok, policy, cwd, env):
+    if not tok or not re.search(r"[/~$.]", tok):
+        return None
+    for variant in _path_variants(tok, cwd, env):
+        hit = _globs_hit(policy.self_protect_paths, variant, env) or _state_dir_hit(variant, env)
+        if hit:
+            return "Bash writes to protected path %s (%s)" % (variant, hit)
+    return None
+
+
+def _first_protected(tokens, policy, cwd, env):
+    for tok in tokens:
+        hit = _protected_hit(tok, policy, cwd, env)
+        if hit:
+            return hit
+    return None
+
+
+def _non_options(args):
+    return [a for a in args if a and not a.startswith("-")]
+
+
+def _segment_write_targets(tokens):
+    """Return (write-target tokens, inline payload or None) for one command segment."""
+    targets = []
+    args = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if re.fullmatch(r"[<>]+[&<>]?", tok):
+            target = tokens[i + 1] if i + 1 < len(tokens) else ""
+            if tok.startswith(">") and target and target != "/dev/null" and not (
+                    tok.endswith("&") and re.fullmatch(r"\d+|-", target)):
+                targets.append(target)
+            i += 2
+            continue
+        args.append(tok)
+        i += 1
+    while args and (args[0] in _COMMAND_PREFIXES or re.match(r"[A-Za-z_][A-Za-z0-9_]*=", args[0])
+                    or (args[0].startswith("-") and len(args) > 1)
+                    or re.fullmatch(r"\d+[smhd]?", args[0])):
+        args = args[1:]
+    if not args:
+        return targets, None
+    cmd = os.path.basename(args[0])
+    rest = args[1:]
+    flags = [a for a in rest if a.startswith("-")]
+    plain = _non_options(rest)
+    if cmd in ("rm", "chmod", "chown", "truncate", "tee"):
+        targets += plain
+    elif cmd in ("sed", "perl"):
+        if any(re.fullmatch(r"-[A-Za-z]*i.*", f) or f == "--in-place" for f in flags):
+            targets += plain
+    elif cmd in ("cp", "mv", "ln", "install", "rsync"):
+        dest = None
+        for k, a in enumerate(rest):
+            if a in ("-t", "--target-directory") and k + 1 < len(rest):
+                dest = rest[k + 1]
+            elif a.startswith("--target-directory="):
+                dest = a.split("=", 1)[1]
+        if dest is None and len(plain) >= 2:
+            dest = plain[-1]
+        if dest:
+            targets.append(dest)
+    elif cmd == "dd":
+        targets += [a[3:] for a in rest if a.startswith("of=")]
+    elif cmd == "sort":
+        for k, a in enumerate(rest):
+            if a in ("-o", "--output") and k + 1 < len(rest):
+                targets.append(rest[k + 1])
+            elif a.startswith("--output="):
+                targets.append(a.split("=", 1)[1])
+    if cmd == "sed":
+        # a sed script command `w file` / `e cmd` writes or executes; force a deny target
+        for a in rest:
+            if not a.startswith("-") and re.search(r"(?:^|[;{}\n])\s*[we]\s+\S", a):
+                targets.append("<sed-script-write>")
+    elif cmd in _INTERP_INLINE:
+        flag = _INTERP_INLINE[cmd]
+        for k, a in enumerate(rest):
+            if a == flag and k + 1 < len(rest):
+                return targets, (cmd, rest[k + 1])
+    return targets, None
+
+
+def _bash_write_hit(command, policy, cwd, env, depth=0):
+    """A protected path only counts as a write target in its own segment."""
+    for tokens in parse_commands(command):
+        targets, inline = _segment_write_targets(tokens)
+        hit = _first_protected(targets, policy, cwd, env)
+        if hit:
+            return hit
+        if inline:
+            cmd, payload = inline
+            if cmd in ("bash", "sh", "zsh", "dash"):
+                if depth < 4:
+                    hit = _bash_write_hit(payload, policy, cwd, env, depth + 1)
+                    if hit:
+                        return hit
+            elif _PAYLOAD_WRITE_RE.search(payload):
+                hit = _first_protected(_PATH_TOKEN_RE.findall(payload), policy, cwd, env)
+                if hit:
+                    return hit
+    return None
+
+
+def self_protect_hit(tool, tool_input, command, policy, cwd, env):
+    """self_protect: the hook, settings, retention script, backups and state dir are read-only to the agent."""
+    cwd = cwd or os.getcwd()
+    if tool in SELF_PROTECT_TOOLS and isinstance(tool_input, dict):
+        for key in ("file_path", "notebook_path", "path", "filePath", "new_path", "target_path"):
+            value = tool_input.get(key)
+            if not isinstance(value, str) or not value.strip():
+                continue
+            for variant in _path_variants(value, cwd, env):
+                hit = _globs_hit(policy.self_protect_paths, variant, env) or _state_dir_hit(variant, env)
+                if hit:
+                    return "%s target %s is protected (%s)" % (tool, variant, hit)
+    if tool == "Bash" and command:
+        return _bash_write_hit(command, policy, cwd, env)
+    return None
+
+
+def secret_path_hit(tool, tool_input, cwd, env, extended=False):
+    """Return a reason string when the call touches a protected secret path."""
+    if tool not in GUARDED_TOOLS or not isinstance(tool_input, dict):
+        return None
+    roots = [_resolve(r) for r in _secret_roots(env)]
+    roots += _secret_roots(env)
+    cwd = cwd or os.getcwd()
+    candidates = []
+    for key in ("file_path", "path", "notebook_path"):
+        if isinstance(tool_input.get(key), str):
+            candidates.append(tool_input[key])
+    if tool in ("Grep", "Glob") and not isinstance(tool_input.get("path"), str):
+        candidates.append(cwd)
+    for key in ("pattern", "glob"):
+        value = tool_input.get(key)
+        if tool in ("Grep", "Glob") and isinstance(value, str) and (
+                value.startswith("~") or value.startswith("$HOME") or value.startswith("/")):
+            candidates.append(value)
+    home = _home(env) or ""
+    for raw in candidates:
+        text = raw.strip()
+        if home:
+            text = text.replace("${HOME}", home).replace("$HOME", home)
+        norm = normalise_path(text, cwd, env)
+        if not norm:
+            continue
+        for variant in (norm, _resolve(norm)):
+            for root in roots:
+                if under(variant, root):
+                    return "%s touches protected path %s" % (tool, root)
+                if tool in ("Grep", "Glob") and under(root, variant):
+                    return "%s root %s contains protected path %s" % (tool, variant, root)
+            if extended:
+                base = os.path.basename(variant)
+                if (base.endswith(".pem") or base.startswith("id_rsa")
+                        or base.startswith("id_ed25519")):
+                    return "%s touches key file %s" % (tool, base)
+    return None
+
+
+def breakglass_ok(payload, env):
+    """True for the sanctioned restore.sh whose sha256 matches breakglass.sha256."""
+    if not isinstance(payload, dict) or payload.get("tool_name") != "Bash":
+        return False
+    tool_input = payload.get("tool_input")
+    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    home = _home(env)
+    if not isinstance(command, str) or not home:
+        return False
+    match = re.fullmatch("bash (" + re.escape(os.path.normpath(home)) + _BREAKGLASS_TAIL + ")",
+                         command)
+    if not match:
+        return False
+    try:
+        import hashlib
+        with open(match.group(1), "rb") as fh:
+            actual = hashlib.sha256(fh.read()).hexdigest()
+        with open(os.path.join(home, ".claude", "hooks", "breakglass.sha256"), "r") as fh:
+            wanted = (fh.read().split() or [""])[0].strip().lower()
+    except (IOError, OSError):
+        return False
+    return bool(wanted) and wanted == actual
+
+
+def failclosed(payload, why, env):
+    """The D2 table. Exit 0 for safe/break-glass/harmless reads, else exit 2."""
+    env = os.environ if env is None else env
+    tool = ""
+    tool_input = {}
+    cwd = None
+    if isinstance(payload, dict):
+        tool = payload.get("tool_name") or payload.get("toolName") or ""
+        tool_input = payload.get("tool_input")
+        cwd = payload.get("cwd")
+    if breakglass_ok(payload, env) or tool in SAFE_TOOLS:
+        return 0
+    if tool in READ_TOOLS and not secret_path_hit(tool, tool_input, cwd, env):
+        return 0
+    reason = ("deny: the L1 policy hook failed closed (%s); only the safe tool set and "
+              "reads outside secret paths are allowed until it is repaired" % why)
+    sys.stderr.write("l1-policy: %s\n" % reason)
+    sys.stdout.write(json.dumps(render(DENY, reason, "error.failclosed")) + "\n")
+    return 2
+
+
+# ---------------------------------------------------------------------------
 # verdicts
 # ---------------------------------------------------------------------------
 
@@ -936,6 +1451,7 @@ def ask(reason, capability, code, detail=None):
 
 
 _REASON_CODE_RE = re.compile(r"\s*\[reason_code=[a-z0-9_.]+\]")
+_REASON_CODE_VALUE_RE = re.compile(r"\[reason_code=([^\]]+)\]")
 
 
 def with_reason_code(reason, code):
@@ -1237,7 +1753,12 @@ def _denied_read_path(tokens, policy, cwd, env):
         if not resolved:
             continue
         for pattern in policy.bash_read_denied_paths:
-            if glob_match(pattern, resolved):
+            # `~/` in the glob is expanded against HOME so the pattern
+            # lines up with the resolved absolute path normalise_path()
+            # produced: `~/.secrets/**` and `~/.ssh/**` only match when the
+            # pattern itself is expanded to the same prefix.
+            expanded_pattern = os.path.expanduser(pattern)
+            if glob_match(expanded_pattern, resolved):
                 return token
     return None
 
@@ -1294,6 +1815,25 @@ def _classify_segment(tokens, policy, cwd, env):
                 ), argv0
             return allow("read-only git sub-command 'git %s'." % sub, "git-read",
                          "bash.git_read"), argv0
+        if sub == "push":
+            tail = tokens[2:]
+            force_flag = any(
+                t == "--force" or t == "-f"
+                or t == "--force-with-lease"
+                or t.startswith("--force-with-lease=")
+                for t in tail
+            )
+            plus_ref = any(
+                not t.startswith("-") and t.startswith("+")
+                for t in tail
+            )
+            if force_flag or plus_ref:
+                return deny(
+                    policy,
+                    "git-force",
+                    "git push with force rewrites remote history; never from L1",
+                    "bash.denied.git_force",
+                ), argv0
         return deny(
             policy,
             "git-write",
@@ -1382,11 +1922,216 @@ def _classify_segment(tokens, policy, cwd, env):
     ), argv0
 
 
+_SSH_COMPOUND_RE = re.compile(r"[;&|<>(){}`\n]|\$\(")
+_SSH_OPTS_WITH_ARG = frozenset("BbcDEeFIiJLlmOopQRSWw")
+_REMOTE_PREFIXES = frozenset(("sudo", "env", "command", "nohup", "time", "exec", "doas",
+                              "nice", "ionice", "timeout", "xargs", "busybox"))
+_REMOTE_HALT = frozenset(("shutdown", "reboot", "poweroff", "halt"))
+
+
+def _ssh_payloads(segments, policy):
+    """Return the remote command text of every ssh segment ('' for a login)."""
+    out = []
+    for tokens in segments:
+        tokens = _peel_wrappers(list(tokens), policy)
+        if not tokens or argv0_of(tokens[0]).lower() != "ssh":
+            continue
+        rest = tokens[1:]
+        i = 0
+        host_seen = False
+        while i < len(rest):
+            tok = rest[i]
+            if not host_seen and tok.startswith("-") and len(tok) > 1:
+                i += 2 if (tok[-1] in _SSH_OPTS_WITH_ARG and len(tok) == 2) else 1
+                continue
+            if not host_seen:
+                host_seen = True
+                i += 1
+                continue
+            break
+        out.append(" ".join(rest[i:]))
+    return out
+
+
+def _remote_destructive(payload):
+    """Best-effort: name the destructive form in an ssh payload, else ''."""
+    import shlex
+    for part in re.split(r"[;&|\n(){}`]+|\$\(", payload):
+        try:
+            toks = shlex.split(part)
+        except ValueError:
+            toks = part.split()
+        while toks and (toks[0] in _REMOTE_PREFIXES or "=" in toks[0].split("/")[0]
+                        or (toks[0].startswith("-") and len(toks) > 1)):
+            toks = toks[1:]
+        if not toks:
+            continue
+        cmd = os.path.basename(toks[0])
+        args = toks[1:]
+        flags = [a for a in args if a.startswith("-")]
+        short = "".join(f[1:] for f in flags if not f.startswith("--"))
+        if cmd == "rm" and (("r" in short or "R" in short or "--recursive" in flags)
+                            and ("f" in short or "--force" in flags)):
+            return "rm -rf"
+        if cmd == "find" and "-delete" in args:
+            return "find -delete"
+        if cmd.startswith("mkfs"):
+            return "mkfs"
+        if cmd == "dd" and any(a.startswith("of=") for a in args):
+            return "dd of="
+        if cmd in _REMOTE_HALT:
+            return cmd
+        if cmd == "docker" or cmd == "docker-compose":
+            words = [a for a in args if not a.startswith("-")]
+            if cmd == "docker" and words[:1] == ["compose"]:
+                words = words[1:]
+                cmd = "docker-compose"
+            if cmd == "docker" and (words[:1] in (["rm"], ["rmi"]) or words[:2] == ["volume", "rm"]
+                                    or words[:2] == ["system", "prune"]):
+                return "docker " + " ".join(words[:2])
+            if cmd == "docker-compose" and words[:1] == ["down"] and (
+                    "-v" in args or "--volumes" in args):
+                return "docker compose down -v"
+        if cmd == "git" and "push" in args and any(
+                a in ("-f", "--force") or a.startswith("--force-with-lease")
+                or (a.startswith("+") and len(a) > 1) for a in args):
+            return "git push --force"
+        if cmd == "truncate" and "-s" in args and args[args.index("-s") + 1:][:1] == ["0"]:
+            return "truncate -s 0"
+    if re.search(r">\s*/dev/sd", payload):
+        return "> /dev/sd"
+    return ""
+
+
+def _enforced_code(code, policy):
+    code = code or ""
+    return is_locked_code(code, policy.locked_reason_prefixes) or any(
+        code.startswith(p) for p in policy.enforce_reason_prefixes)
+
+
+def _inline_secret_hit(command, policy, cwd, env):
+    """Any word of the line, quoted or inside an interpreter payload, on a read-denied path."""
+    for tok in _PATH_TOKEN_RE.findall(command):
+        if not re.search(r"[/~$.]", tok):
+            continue
+        for variant in _path_variants(tok, cwd, env):
+            if _globs_hit(policy.tool_read_denied_paths, variant, env):
+                return tok
+    return None
+
+
+def _inline_shell_verdict(tokens, policy, cwd, env, depth=0):
+    """Verdict of the payload of `bash -c`, `sh -c`, `zsh -c`, or None."""
+    tokens = _peel_wrappers(list(tokens), policy)
+    if depth > 3 or len(tokens) < 3 or argv0_of(tokens[0]).lower() not in ("bash", "sh", "zsh", "dash"):
+        return None
+    for k, tok in enumerate(tokens[1:-1], 1):
+        if tok == "-c" or (tok.startswith("-") and not tok.startswith("--") and tok.endswith("c")):
+            verdict = evaluate_bash(tokens[k + 1], policy, cwd, env)
+            return verdict if verdict.decision == DENY else None
+    return None
+
+
+def _redirect_target_allowed(target, policy, cwd, env):
+    """A shell write target must be a path the Write tool may write (write_allowed_paths)."""
+    home = _home(env)
+    tgt = (target or "").strip("'\"")
+    if not tgt or "$" in tgt or "`" in tgt or tgt.startswith("<"):
+        return False
+    if tgt.startswith("~"):
+        tgt = home + tgt[1:]
+    if not os.path.isabs(tgt):
+        tgt = os.path.join(cwd or os.getcwd(), tgt)
+    tgt = os.path.normpath(tgt)
+    for pattern in policy.write_allowed_paths:
+        pat = home + pattern[1:] if pattern.startswith("~") else pattern
+        if glob_match(pat, tgt):
+            return True
+    return False
+
+
+_HEREDOC_REDIR_RE = re.compile(r"(?:^|[\s;|&(])(\d*)(>&|&?>>?\|?)\s*([^\s;&|()]+)")
+
+
+def _heredoc_line_write_targets(raw):
+    """parse_commands drops redirects that share a line with `<<` / `<<<`; scan those lines raw."""
+    found = []
+    for line in (raw or "").split("\n"):
+        if "<<" not in line:
+            continue
+        flat = re.sub(r'"[^"]*"|\'[^\']*\'', '""', line)
+        for _fd, op, target in _HEREDOC_REDIR_RE.findall(flat):
+            if op == ">&" and re.fullmatch(r"\d+|-", target):
+                continue
+            if target == "/dev/null":
+                continue
+            found.append(target)
+    return found
+
+
 def evaluate_bash(command, policy, cwd, env):
     """Check every segment of a (possibly compound) Bash command line."""
     segments = parse_commands(command or "")
     if not segments:
         return allow("empty command, nothing to run.", "empty", "bash.empty")
+    # ssh payloads: best-effort remote destructive check and the compound
+    # check run first and are enforced whatever the mode (design D1).
+    raw_command = command or ""
+    payloads = _ssh_payloads(segments, policy)
+    for payload in payloads:
+        if _SSH_COMPOUND_RE.search(payload):
+            return deny(
+                policy,
+                "ssh-compound",
+                "the ssh payload carries a shell operator, so no ssh_allowed exception applies",
+                "bash.denied.ssh_compound",
+            )
+        hit = _remote_destructive(payload)
+        if hit:
+            return deny(
+                policy,
+                "ssh-remote-destructive",
+                "the ssh payload looks destructive (%s); best-effort check" % hit,
+                "bash.denied.remote_destructive",
+            )
+    # Staged L1 policy: an ssh invocation whose WHOLE command line fully
+    # matches one of the compiled ssh_allowed regexes is allowed before the
+    # per-segment classifier denies `ssh` as remote, but only when the
+    # command carries no compound operators anywhere.
+    if policy.ssh_allowed and payloads and not _SSH_COMPOUND_RE.search(raw_command):
+        for pattern_re in policy.ssh_allowed:
+            if pattern_re.fullmatch(raw_command):
+                return allow(
+                    "ssh command matches an allowed planner pattern.",
+                    "ssh-allowed",
+                    "bash.ssh_allowed",
+                )
+    secret = _inline_secret_hit(raw_command, policy, cwd, env)
+    if secret:
+        return deny(
+            policy,
+            "bash-read-guard",
+            "the command names '%s', a credential path the L1 session never touches" % secret,
+            "bash.denied.read_guard",
+        )
+    for wt in _heredoc_line_write_targets(raw_command):
+        if not _redirect_target_allowed(wt, policy, cwd, env):
+            return deny(
+                policy,
+                "bash-redirect-write",
+                "the command writes '%s', which is outside write_allowed_paths" % wt,
+                "bash.denied.redirect_write",
+            )
+    for tokens in segments:
+        wtargets, _inline = _segment_write_targets(tokens)
+        for wt in wtargets:
+            if not _redirect_target_allowed(wt, policy, cwd, env):
+                return deny(
+                    policy,
+                    "bash-redirect-write",
+                    "the command writes '%s', which is outside write_allowed_paths" % wt,
+                    "bash.denied.redirect_write",
+                )
     checked = []
     verdicts = []
     for tokens in segments:
@@ -1396,10 +2141,15 @@ def evaluate_bash(command, policy, cwd, env):
             "decision": verdict.decision if verdict else "skip",
         })
         verdicts.append(verdict)
-        if verdict is not None and verdict.decision == DENY:
-            detail = dict(verdict.detail)
-            detail["segments"] = checked
-            return Verdict(DENY, verdict.reason, verdict.capability, verdict.code, detail)
+        inner = _inline_shell_verdict(tokens, policy, cwd, env)
+        if inner is not None:
+            verdicts.append(inner)
+    denied = [v for v in verdicts if v is not None and v.decision == DENY]
+    if denied:
+        pick = next((v for v in denied if _enforced_code(v.code, policy)), denied[0])
+        detail = dict(pick.detail)
+        detail["segments"] = checked
+        return Verdict(DENY, pick.reason, pick.capability, pick.code, detail)
     if len(segments) == 1:
         single = verdicts[0]
         if single is None:
@@ -1476,6 +2226,7 @@ def resolve_state_dir(env, override=None):
     home = _home(env)
     if home:
         return os.path.abspath(os.path.join(home, ".local", "state", "claude-hooks", "l1-policy"))
+    import tempfile  # lazy: only the no-HOME fallback needs it
     return os.path.join(tempfile.gettempdir(), "l1-policy")
 
 
@@ -1669,6 +2420,17 @@ def evaluate_tool(payload, policy, cwd, env):
     if not isinstance(tool_input, dict):
         tool_input = {}
 
+    hit = secret_path_hit(tool, tool_input, cwd, env, extended=True)
+    if hit:
+        return deny(policy, "read-guard", hit, "tool.denied.read_guard")
+    hit = tool_path_hit(tool, tool_input, policy, cwd, env)
+    if hit:
+        return deny(policy, "read-guard", hit, "tool.denied.read_guard")
+    hit = self_protect_hit(tool, tool_input, tool_input.get("command") if tool == "Bash" else "",
+                           policy, cwd, env)
+    if hit:
+        return deny(policy, "self-protect", hit, "tool.denied.self_protect")
+
     if tool == "Bash":
         return evaluate_bash(tool_input.get("command") or "", policy, cwd, env)
 
@@ -1729,6 +2491,8 @@ def render(decision, reason, code=None):
 def decide(payload, policy, env=None, state_dir=None, audit_log=None, state_store=None):
     """Decide one PreToolUse call.  Returns (hook_output, detail_dict)."""
     env = os.environ if env is None else env
+    if env.get("L1_TEST_RAISE") == "1":
+        raise RuntimeError("L1_TEST_RAISE=1 forced internal error")
     cwd = payload.get("cwd") or env.get("L1_POLICY_CWD") or os.getcwd()
     session_id = payload.get("session_id") or payload.get("sessionId") or "default"
     tool = payload.get("tool_name") or payload.get("toolName") or ""
@@ -1749,6 +2513,10 @@ def decide(payload, policy, env=None, state_dir=None, audit_log=None, state_stor
     verdict = evaluate_tool(payload, policy, cwd, env)
 
     override_raw = (env.get(policy.override_env_var) or "").strip()
+    # D3: the override never lifts a locked (security) code.
+    if override_raw and verdict.decision != ALLOW and is_locked_code(
+            verdict.code, policy.locked_reason_prefixes):
+        override_raw = ""
     if override_raw:
         log_path = resolve_audit_log(env, state_dir, policy, audit_log)
         record = {
@@ -1839,6 +2607,7 @@ def decide(payload, policy, env=None, state_dir=None, audit_log=None, state_stor
 
 
 def build_parser():
+    import argparse  # lazy: the hot path never builds a parser
     parser = argparse.ArgumentParser(
         prog="l1-policy.py",
         description="Claude Code PreToolUse capability-policy hook (L1 plan-and-dispatch).",
@@ -1943,6 +2712,8 @@ def explain_policy(policy):
         "default_mode": DEFAULT_MODE,
         "modes": list(MODES),
         "shadow_audit_log": policy.shadow_audit_log,
+        "shadow_log_allow": policy.shadow_log_allow,
+        "shadow_max_bytes": policy.shadow_max_bytes,
         "reason_codes": sorted(REASON_CODES),
     }
 
@@ -1969,23 +2740,62 @@ def emit_decision(out, mode, detail=None, annotate=False, policy=None, env=None,
     """
     if normalise_mode(mode) != ENFORCE:
         policy = policy if policy is not None else load_policy()
+        if (not policy.shadow_log_allow
+                and (detail or {}).get("decision") == ALLOW
+                and not (detail or {}).get("budget_warning")
+                and not (detail or {}).get("budget_escalated")):
+            return 0
         env = os.environ if env is None else env
         if state_dir is None:
             state_dir = resolve_state_dir(env)
         log_path = resolve_shadow_log(env, state_dir, policy, shadow_log)
+        if policy.shadow_max_bytes > 0:
+            try:
+                if os.path.getsize(log_path) > policy.shadow_max_bytes:
+                    os.replace(log_path, log_path + ".1")
+            except OSError:
+                pass
         append_audit(log_path, shadow_record(policy, detail, session_id, tool,
                                              tool_input, SHADOW))
         return 0
     return _emit(out, annotate, detail)
 
 
+def _fallback_payload(args):
+    """Best-effort payload for the fail-closed path; None means unknown tool."""
+    if args.command is not None:
+        return {"tool_name": "Bash", "tool_input": {"command": args.command},
+                "cwd": args.cwd or os.getcwd()}
+    if args.tool:
+        try:
+            tool_input = json.loads(args.tool_input) if args.tool_input else {}
+        except ValueError:
+            tool_input = {}
+        return {"tool_name": args.tool, "tool_input": tool_input,
+                "cwd": args.cwd or os.getcwd()}
+    try:
+        raw = sys.stdin.read()
+        payload = json.loads(raw)
+    except Exception:  # noqa: BLE001
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def main(argv=None):
+    if argv is None and len(sys.argv) == 1 and _fast_safe_allow(dict(os.environ)):
+        return 0
     args = build_parser().parse_args(argv)
     try:
-        policy = load_policy(args.policy)
-    except (IOError, OSError, PolicyError) as exc:
+        _cache_env = dict(os.environ)
+        if args.state_dir:
+            _cache_env["L1_POLICY_STATE_DIR"] = args.state_dir
+        policy = load_policy(args.policy, cache_dir=resolve_state_dir(_cache_env, args.state_dir))
+    except Exception as exc:  # noqa: BLE001 - missing, unreadable or unparsable policy
         sys.stderr.write("l1-policy: cannot load policy: %s\n" % exc)
-        return 1
+        if args.lint or args.explain or args.reset:
+            return 1
+        return failclosed(_fallback_payload(args), "policy not loadable: %s" % exc,
+                          dict(os.environ))
 
     if args.lint:
         problems = lint_policy(policy)
@@ -2019,8 +2829,31 @@ def main(argv=None):
     def finish(out, detail, payload=None):
         """Hand one decided payload to the mode: enforce prints, shadow logs."""
         payload = payload or {}
+        # Staged L1 policy: while the global mode is shadow, a deny whose
+        # `[reason_code=...]` starts with any enforce_reason_prefixes entry
+        # is emitted with mode enforce for this single call (the envelope
+        # goes to stdout, no shadow line is written) instead of being
+        # shadow-logged. Everything else stays on the shadow path.
+        effective_mode = mode
+        reason_text = (
+            out.get("hookSpecificOutput", {}).get("permissionDecisionReason", "")
+        )
+        code_match = _REASON_CODE_VALUE_RE.search(reason_text)
+        reason_code = code_match.group(1) if code_match else ""
+        if (
+            effective_mode == SHADOW
+            and (detail.get("decision") if detail else None) == DENY
+            and (is_locked_code(reason_code, policy.locked_reason_prefixes)
+                 or (policy.enforce_reason_prefixes
+                     and any(
+                         reason_code.startswith(prefix)
+                         for prefix in policy.enforce_reason_prefixes
+                     )))
+        ):
+            effective_mode = ENFORCE
         return emit_decision(
-            out, mode, detail, annotate=args.annotate, policy=policy, env=env,
+            out, effective_mode, detail, annotate=args.annotate, policy=policy,
+            env=env,
             state_dir=state_dir, shadow_log=args.shadow_log,
             session_id=payload.get("session_id") or args.session_id or "default",
             tool=payload.get("tool_name") or payload.get("toolName") or args.tool or "",
@@ -2063,29 +2896,13 @@ def main(argv=None):
         except (IOError, OSError, ValueError):
             raw = ""
         if not raw.strip():
-            return finish(render(
-                ALLOW, "allow: no PreToolUse payload on stdin, nothing to decide.",
-                "input.empty",
-            ), {
-                "capability": "empty-input", "decision": ALLOW,
-                "reason_code": "input.empty", "detail": {},
-            })
+            return failclosed(None, "empty stdin", env)
         try:
             payload = json.loads(raw)
         except ValueError as exc:
-            return finish(render(
-                ASK,
-                "ask: stdin was not a valid PreToolUse JSON payload (%s); the L1 policy could "
-                "not be evaluated, so a human decides. %s." % (exc, policy.dispatch_hint),
-                "input.unreadable",
-            ), {"capability": "unreadable-input", "decision": ASK,
-                "reason_code": "input.unreadable", "detail": {}})
+            return failclosed(None, "stdin is not JSON: %s" % exc, env)
         if not isinstance(payload, dict):
-            return finish(render(
-                ASK, "ask: the PreToolUse payload was not a JSON object.",
-                "input.unreadable",
-            ), {"capability": "unreadable-input", "decision": ASK,
-                "reason_code": "input.unreadable", "detail": {}})
+            return failclosed(None, "stdin payload is not a JSON object", env)
 
     event = payload.get("hook_event_name") or payload.get("hookEventName") or "PreToolUse"
     if event != "PreToolUse":
@@ -2100,6 +2917,9 @@ def main(argv=None):
     if args.cwd:
         payload["cwd"] = args.cwd
 
+    if breakglass_ok(payload, env):
+        return 0
+
     try:
         out, detail = decide(payload, policy, env=env, state_dir=state_dir,
                              audit_log=args.audit_log, state_store=store)
@@ -2107,13 +2927,7 @@ def main(argv=None):
         if args.strict:
             raise
         sys.stderr.write("l1-policy: internal error: %s: %s\n" % (type(exc).__name__, exc))
-        return finish(render(
-            ASK,
-            "ask: the L1 policy hook failed internally (%s: %s); a human decides. %s."
-            % (type(exc).__name__, exc, policy.dispatch_hint),
-            "error.internal",
-        ), {"capability": "internal-error", "decision": ASK,
-            "reason_code": "error.internal", "detail": {}})
+        return failclosed(payload, "internal error %s: %s" % (type(exc).__name__, exc), env)
 
     return finish(out, detail, payload)
 

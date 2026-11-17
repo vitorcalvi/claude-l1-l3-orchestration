@@ -10,6 +10,11 @@ set -u
 CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 CONFIG="$CLAUDE_DIR/news-bar.json"
 CACHE="$CLAUDE_DIR/news-bar-cache.json"
+_dl="$(dirname "$0")"
+for _f in "$_dl/bin/_deadline.sh" "$CLAUDE_DIR/bin/_deadline.sh" "$_dl/_deadline.sh"; do
+  [[ -f "$_f" ]] && { . "$_f"; break; }
+done
+command -v with_deadline >/dev/null 2>&1 || exit 0
 
 cfg() { jq -r "$1 // empty" "$CONFIG" 2>/dev/null; }
 
@@ -23,7 +28,7 @@ max_items="${max_items:-5}"
 tmp="$(mktemp "${CACHE}.XXXXXX")" || exit 0
 trap 'rm -f "$tmp" "$tmp.xml"' EXIT
 
-curl -fsS -m "$timeout_s" -A 'Mozilla/5.0' -o "$tmp.xml" "$feed_url" 2>/dev/null || exit 0
+with_deadline "$((timeout_s + 3))" curl -fsS -m "$timeout_s" -A 'Mozilla/5.0' -o "$tmp.xml" "$feed_url" 2>/dev/null || exit 0
 
 # -I: isolated mode, so nothing from cwd/env is imported.
 python3 -I - "$tmp.xml" "$max_items" >"$tmp" 2>/dev/null <<'PY' || exit 0

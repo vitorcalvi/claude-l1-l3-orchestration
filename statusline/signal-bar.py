@@ -24,6 +24,8 @@ LLM_CACHE = os.path.join(CLAUDE_DIR, "signal-llm-cache.json")
 WATCHLIST_FILE = os.path.join(CLAUDE_DIR, "watchlist.txt")
 ET_TZ = ZoneInfo("America/New_York")
 UA = {"User-Agent": "Mozilla/5.0"}
+FETCH_BUDGET_S = 20
+_deadline = [None]  # monotonic time at which the total fetch budget ends
 
 DEFAULTS = {
     "enable": True,
@@ -105,9 +107,15 @@ def load_json(path, default):
 
 def write_json_atomic(path, data):
     tmp = f"{path}.{os.getpid()}.tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f, ensure_ascii=False)
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 def load_config():
@@ -136,10 +144,20 @@ def resolve_watchlist(cfg):
     return norm(cfg.get("watchlist") or []) or norm(cfg["fallback_watchlist"])
 
 
+def budget(timeout):
+    """Per-request timeout clamped to what is left of the total fetch budget."""
+    if _deadline[0] is None:
+        return timeout
+    left = _deadline[0] - time.monotonic()
+    if left <= 0.1:
+        raise TimeoutError("fetch budget exhausted")
+    return min(timeout, left)
+
+
 def http_get(url, timeout):
     import urllib.request
     req = urllib.request.Request(url, headers=UA)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with urllib.request.urlopen(req, timeout=budget(timeout)) as r:
         return r.read()
 
 
@@ -254,7 +272,7 @@ def llm_classify(cfg, titles, cache):
                                      headers={"Content-Type": "application/json",
                                               "Authorization": f"Bearer {key}"})
         try:
-            with urllib.request.urlopen(req, timeout=llm["timeout_s"]) as r:
+            with urllib.request.urlopen(req, timeout=budget(llm["timeout_s"])) as r:
                 text = json.loads(r.read())["choices"][0]["message"]["content"]
         except Exception:
             return  # endpoint down: stop, retry next cycle (nothing cached)
@@ -324,6 +342,7 @@ def fetch(cfg):
     import urllib.parse
     import urllib.request
     import xml.etree.ElementTree as ET
+    _deadline[0] = time.monotonic() + FETCH_BUDGET_S
     cache = load_json(CACHE, {})
     now = time.time()
     watch = resolve_watchlist(cfg)

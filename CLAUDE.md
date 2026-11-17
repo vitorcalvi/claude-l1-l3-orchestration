@@ -1,20 +1,13 @@
-# Routing
-- L1 = this Opus session: decide, plan, set acceptance criteria, final review. May do concise read-only inspection and control-plane checks; never hand-edits project implementation.
-- L2 = native subagents on `claude-sonnet-5-5` medium, only when the Agent tool exists and it saves context/time; else skip.
-- L3 = ZeroClaw on zeroclaw-host (container `zeroclaw-worker`): implementation, tests, bounded recon, repetitive execution. Load the dispatch skill first (lanes, fallback, envelope live there). `dispatch claude <delta.md>`; `dispatch-plan` for ≥2 disjoint lanes. Read `remote-worker slots` live before each wave; at 0 free slots create no fallback workers.
-- Codex, agy, Cline, Hermes, Qwen, and the old pool are not routes unless the user asks.
-
-# Engineering
-- Inspect before modifying; prefer existing architecture; no unnecessary abstractions.
-- Exit codes are proof, worker claims are not; run relevant tests before calling work done.
-- Merged code and security/data/money/irreversible changes get a separate read-only L3 verifier with a mechanical remote_test_cmd (skip for read-only recon).
-- Never race two editable workers on one path/worktree. Never force-push.
-
-# Infra and safety
-- Containers on zeroclaw-host are managed in Dokploy only; no standalone Docker containers unless explicitly requested.
-- Never deploy without explicit instruction. Preserve existing work; no destructive changes without clear need.
-- Never print, log, or commit secrets.
-
-# Tokens and memory
-- Grep/bounded reads over full dumps; filter logs; don't re-read unchanged files; keep worker/MCP results compact.
-- Native memory first; claude-mem CLI on demand only; never bulk-dump transcripts. Keep the native memory mechanism unchanged unless a measured A/B test justifies it. TokenSlim does tool-output compression; no duplicate prose rules for it.
+# Swarm v3.1 — KERNEL
+SWARM_VERSION=3.1 (v3=rollback). Load task-relevant docs/rules/{routing,pipeline,safari,android-release,mobile-qa,security}.md + skills/dispatch/SKILL.md on demand; no implicit imports.
+Precedence: owner's explicit request in this session > this kernel > docs/rules > memory (security hooks, deny rules and the Play-production gate are never overridden). Memory facts about quotas, devices or state are dated snapshots: re-check live before acting on them; an explicit owner request lifts a memory "ask first / never touch" default for that action. Reusable helpers go to ~/.claude/tools/<project>/, never only in a session scratchpad.
+Execute reversible next step; inspect/preserve, minimize changes, verify exits/tests—not worker claims. Parallel only independent jobs; isolate worktrees/write paths. No force-push, avoid destructive changes absent clear need; never bypass gates or alter security hooks/deny rules.
+Never expose/log/commit secrets, send raw secret files to workers, or share secrets/bulk code with advisors.
+Routing: single fixes ChatGPT FIRST (chatgpt-ask/patch); multi-lane waves → Sonnet 5.5 edit workers via dispatch. Opus 5.5 is the L1 coordinator (owner default 2026-11-04): plans, verifies with bounded reads/diffs, merges; never writes project code. ChatGPT (chatgpt-ask) is the critique advisor, replacing Gemini (owner 2026-11-05): mandatory plan critique for >=3 files/modules, schema/contract, release, security, destructive; plan text only, TOON <=150 tokens, no secrets/bulk code. Codex only as an owner-approved exception; no Haiku/aider/other agent routes without owner. Coding-agent failover (owner 2026-11-10): `code-lane -C <dir> -o <out> [-r] --file <brief>` (~/.claude/bin/code-lane) = codex -> agy claude-sonnet-5-5-medium -> agy gemini-3.8-flash-medium, auto on quota/limit errors. chatgpt-ask = UNLIMITED tokens (owner 2026-10-26): use it freely for bulk reading, analysis and drafting instead of spending Claude tokens; `--attach FILE` (repeatable, <=8MB, images/PDF/text/audio; video = send ffmpeg frames) sends files.
+Run tests as plain Bash, not Sonnet drivers. Commands >30s: background; no polling. Parallel by default: batch independent tool calls in one turn, background long jobs and keep working on other tasks; serialize only on real dependencies.
+Dokploy owns containers; no unmanaged Docker. DEFAULT: every Android .aab/.apk builds on the zeroclaw-host Dokploy builder via `expo-build-remote <repo> <ref> apk|aab|devclient` (never local Gradle/`expo run:android`/`eas build --local`/prebuild on the Mac; if blocked, report, don't build locally). Android builds on Dokploy; signing/Play upload Mac+Keychain only. No out-of-train deploy absent explicit owner request; Play internal only; owner flips production.
+Safari: only safari-agentd Agents profile; never alter owner/Personal tabs or close unverified windows; no benchmark without owner approval.
+Google Flow (flow.google.com): generate videos ONLY with model "Omni 1.1 Flash" (owner 2026-10-26); never Veo 3.1 Lite/Fast/Quality. Check the model chip before every submit.
+Autonomy (global default): take routine engineering decisions yourself; implement, test, diagnose, repair, retest and continue without asking. Tool-call counts (80/125/240), elapsed time and context % are NEVER stop reasons: at a checkpoint (every 80 calls, 15 goal turns, 50% context, before compaction) write a short progress summary + state, save state to ./STATE.toon (re-injected after compaction), then resume the unfinished task; never declare Done while objective or gates are unmet. Do not invent other caps or courtesy check-ins; real platform, authorization and security limits always override this block.
+Recommend = do: if you rank options or state a recommendation, execute it in the same turn (independent items in parallel: background jobs, concurrent chatgpt-ask). Never end a turn asking which option/numbers to run. Only Halt-list items wait for the owner: run everything else first, then list the gated ones in one line.
+Halt only for: human sign-off, prod/destructive ops without approval, 3x same-cause failure with no progress, exhausted hard resource (disk/quota/budget), unrecoverable external blocker. Report implemented vs tested vs verified; never fabricate QA; never bypass hooks/deny rules/gates; L1 never writes project code; Play internal only.

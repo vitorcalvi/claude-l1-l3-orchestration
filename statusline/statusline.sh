@@ -58,6 +58,8 @@ PREFERRED_BUN="${CLAUDE_HUD_RUNTIME:-$HOME/.bun/bin/bun}"
 # ---------------------------------------------------------------------------
 
 if [[ "${COLUMNS:-}" =~ ^[0-9]+$ ]] && (( COLUMNS > 0 )); then
+  (( ${#COLUMNS} > 4 || 10#$COLUMNS > 400 )) && COLUMNS=400
+  COLUMNS=$((10#$COLUMNS))
   if (( COLUMNS > 4 )); then
     COLUMNS=$((COLUMNS - 4))
   else
@@ -184,6 +186,7 @@ trap 'rm -rf "$work_dir"' EXIT
 f_news=$(mktemp "$work_dir/news.XXXXXX" 2>/dev/null) || exit 0
 f_sig=$(mktemp "$work_dir/sig.XXXXXX" 2>/dev/null) || exit 0
 f_l3=$(mktemp "$work_dir/l3.XXXXXX" 2>/dev/null) || exit 0
+f_swarm=$(mktemp "$work_dir/swarm.XXXXXX" 2>/dev/null) || exit 0
 f_hud=$(mktemp "$work_dir/hud.XXXXXX" 2>/dev/null) || exit 0
 f_accts=$(mktemp "$work_dir/accts.XXXXXX" 2>/dev/null) || exit 0
 
@@ -203,6 +206,81 @@ mtime_of() {
   printf '%s' "$mt"
 }
 
+# clamp VALUE MIN MAX DEFAULT: integer in [MIN, MAX]; anything that is not a
+# non-negative number (null, text, negative) falls back to DEFAULT first.
+clamp() {
+  local v="$1"
+
+  [[ "$v" =~ ^[0-9]+(\.[0-9]*)?$ ]] || v="$4"
+  v=${v%%.*}
+  [[ -n "$v" ]] || v="$4"
+  v=$((10#$v))
+  (( v < $2 )) && v=$2
+  (( v > $3 )) && v=$3
+
+  printf '%s' "$v"
+}
+
+# with_deadline SECONDS CMD...: run CMD (function or program) and kill it, with
+# its direct children, once SECONDS have passed. Output written so far stays.
+with_deadline() {
+  local secs="$1" pid watcher rc
+
+  shift
+  "$@" &
+  pid=$!
+  ( sleep "$secs"; pkill -P "$pid" 2>/dev/null; kill "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+  watcher=$!
+
+  wait "$pid" 2>/dev/null
+  rc=$?
+  kill "$watcher" 2>/dev/null
+  pkill -P "$watcher" 2>/dev/null
+  wait "$watcher" 2>/dev/null
+
+  return "$rc"
+}
+
+# acquire_lock DIR TTL: atomic mkdir lock. A lock whose pid is dead, or that is
+# older than 2*TTL, is moved aside and removed, then mkdir is tried once more.
+acquire_lock() {
+  local lock="$1" ttl="$2" pid age
+
+  mkdir "$lock" 2>/dev/null && return 0
+
+  pid=$(cat "$lock/pid" 2>/dev/null)
+  age=$(( $(date +%s) - $(mtime_of "$lock") ))
+
+  if [[ "$pid" =~ ^[0-9]+$ ]] && ! kill -0 "$pid" 2>/dev/null; then
+    :
+  elif (( age > 2 * ttl )); then
+    :
+  else
+    return 1
+  fi
+
+  mv "$lock" "$lock.stale.$$" 2>/dev/null || return 1
+  rm -rf "$lock.stale.$$"
+  mkdir "$lock" 2>/dev/null
+}
+
+# run_locked LOCK TTL CMD...: when the lock is free, run CMD detached (all fds
+# to /dev/null) and remove the lock when it exits, however it exits.
+run_locked() {
+  local lock="$1" ttl="$2" pid
+
+  shift 2
+  acquire_lock "$lock" "$ttl" || return 0
+  (
+    trap 'rm -rf "$lock"' EXIT
+    trap 'exit 1' HUP INT TERM
+    "$@"
+  ) </dev/null >/dev/null 2>&1 &
+  pid=$!
+  printf '%s\n' "$pid" >"$lock/pid" 2>/dev/null
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # Row: [News] headline
 #
@@ -217,31 +295,30 @@ render_news() {
   [[ -f "$news_config" && -f "$news_cache" ]] || return 0
   [[ "$(jq -r '.enable_news_bar // false' "$news_config" 2>/dev/null)" == true ]] || return 0
 
-  local now refresh_s fetched_at lock_mtime news_line
+  local now refresh_s fetched_at news_line rotate_s max_items
 
   now=$(date +%s)
-  refresh_s=$(( $(jq -r '.refresh_minutes // 10' "$news_config" 2>/dev/null || echo 10) * 60 ))
+  refresh_s=$(( $(clamp "$(jq -r '.refresh_minutes // 10' "$news_config" 2>/dev/null)" 1 1440 10) * 60 ))
+  rotate_s=$(clamp "$(jq -r '.rotate_seconds // 60' "$news_config" 2>/dev/null)" 3 86400 60)
+  max_items=$(clamp "$(jq -r '.max_items // 50' "$news_config" 2>/dev/null)" 1 50 50)
   fetched_at=$(jq -r '.fetched_at // 0' "$news_cache" 2>/dev/null || echo 0)
   [[ "$fetched_at" =~ ^[0-9]+$ ]] || fetched_at=0
 
   if (( now - fetched_at >= refresh_s )) && [[ -x "$news_fetcher" ]]; then
-    lock_mtime=$(mtime_of "$news_lock")
-    if (( now - lock_mtime >= 60 )); then
-      mkdir -p "$news_lock" 2>/dev/null && touch "$news_lock"
-      ( "$news_fetcher" </dev/null >/dev/null 2>&1 & )
-    fi
+    run_locked "$news_lock" "$refresh_s" "$news_fetcher"
   fi
 
-  news_line=$(jq -r --slurpfile cfg "$news_config" --argjson now "$now" '
+  news_line=$(jq -r --slurpfile cfg "$news_config" --argjson now "$now" \
+    --argjson rot "$rotate_s" --argjson mi "$max_items" '
     ($cfg[0]) as $c
-    | [.items[]?.title] as $t
+    | [.items[:$mi][]?.title] as $t
     | ($c.max_headline_length // 60) as $max
     | def cut($n): if length > $n then .[0:$n-1] + "…" else . end;
     if ($t | length) == 0 then empty
     elif ($c.mode // "rotate") == "ticker" then
       $t | map(cut($max)) | join(" | ") | cut($max * 3)
     else
-      $t[(($now / ($c.rotate_seconds // 60)) | floor) % ($t | length)] | cut($max)
+      $t[(($now / $rot) | floor) % ($t | length)] | cut($max)
     end
   ' "$news_cache" 2>/dev/null)
 
@@ -263,19 +340,15 @@ render_sig() {
   [[ -f "$sig_config" && -f "$sig_cache" && -f "$sig_script" ]] || return 0
   [[ "$(jq -r '.enable // false' "$sig_config" 2>/dev/null)" == true ]] || return 0
 
-  local now sig_refresh sig_fetched lock_mtime sig_line
+  local now sig_refresh sig_fetched sig_line
 
   now=$(date +%s)
-  sig_refresh=$(jq -r '.market_ttl_s // 60' "$sig_config" 2>/dev/null || echo 60)
+  sig_refresh=$(clamp "$(jq -r '.market_ttl_s // 60' "$sig_config" 2>/dev/null)" 30 86400 60)
   sig_fetched=$(jq -r '.fetched_at // 0' "$sig_cache" 2>/dev/null || echo 0)
   [[ "$sig_fetched" =~ ^[0-9]+$ ]] || sig_fetched=0
 
   if (( now - sig_fetched >= sig_refresh )); then
-    lock_mtime=$(mtime_of "$sig_lock")
-    if (( now - lock_mtime >= sig_refresh )); then
-      mkdir -p "$sig_lock" 2>/dev/null && touch "$sig_lock"
-      ( "$sig_py" -I "$sig_script" fetch </dev/null >/dev/null 2>&1 & )
-    fi
+    run_locked "$sig_lock" "$sig_refresh" "$sig_py" -I "$sig_script" fetch
   fi
 
   sig_line=$("$sig_py" -I "$sig_script" render 2>/dev/null)
@@ -299,19 +372,15 @@ render_l3() {
   [[ -f "$l3_config" && -f "$l3_cache" ]] || return 0
   [[ "$(jq -r '.enable // false' "$l3_config" 2>/dev/null)" == true ]] || return 0
 
-  local now l3_refresh l3_fetched lock_mtime l3_line
+  local now l3_refresh l3_fetched l3_line
 
   now=$(date +%s)
-  l3_refresh=$(jq -r '.refresh_seconds // 15' "$l3_config" 2>/dev/null || echo 15)
+  l3_refresh=$(clamp "$(jq -r '.refresh_seconds // 15' "$l3_config" 2>/dev/null)" 10 86400 15)
   l3_fetched=$(jq -r '.fetched_at // 0' "$l3_cache" 2>/dev/null || echo 0)
   [[ "$l3_fetched" =~ ^[0-9]+$ ]] || l3_fetched=0
 
   if (( now - l3_fetched >= l3_refresh )) && [[ -x "$l3_fetcher" ]]; then
-    lock_mtime=$(mtime_of "$l3_lock")
-    if (( now - lock_mtime >= l3_refresh )); then
-      mkdir -p "$l3_lock" 2>/dev/null && touch "$l3_lock"
-      ( "$l3_fetcher" </dev/null >/dev/null 2>&1 & )
-    fi
+    run_locked "$l3_lock" "$l3_refresh" "$l3_fetcher"
   fi
 
   l3_line=$(jq -r --slurpfile cfg "$l3_config" --argjson now "$now" '
@@ -442,15 +511,27 @@ render_hud() {
   fi
 }
 
+# Swarm row: one-line summary from swarm-status, hidden when empty or missing.
+render_swarm() {
+  [[ -x "$HOME/.claude/bin/swarm-status" ]] || return 0
+  local line
+  line=$("$HOME/.claude/bin/swarm-status" summary 2>/dev/null </dev/null | head -n 1) || return 0
+  [[ -n "$line" ]] && printf '\033[2m[Swarm]\033[0m %s\n' "$line"
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # Render every row concurrently
 # ---------------------------------------------------------------------------
 
-render_news  >"$f_news"  2>/dev/null &
-render_sig   >"$f_sig"   2>/dev/null &
-render_l3    >"$f_l3"    2>/dev/null &
-render_accts >"$f_accts" 2>/dev/null &
-render_hud   >"$f_hud"   2>/dev/null &
+with_deadline 2 render_news  >"$f_news"  2>/dev/null &
+with_deadline 2 render_sig   >"$f_sig"   2>/dev/null &
+with_deadline 2 render_l3    >"$f_l3"    2>/dev/null &
+with_deadline 2 render_swarm >"$f_swarm" 2>/dev/null &
+# [Accts] row off 2026-11-08: single account, duplicates the HUD Usage/Weekly bars (and read 5h 0% while HUD read 13%).
+# Re-enable by removing the leading '#'. The clauth daemon itself is untouched.
+# with_deadline 2 render_accts >"$f_accts" 2>/dev/null &
+with_deadline 2 render_hud   >"$f_hud"   2>/dev/null &
 
 wait
 
@@ -473,7 +554,7 @@ nocolor=""
 [[ -n "${NO_COLOR:-}" ]] && nocolor=1
 
 LC_ALL=C awk -v max="$COLUMNS" -v nocolor="$nocolor" -v divider="$divider" \
-  -v newsf="$f_news" -v sigf="$f_sig" -v l3f="$f_l3" -v acktf="$f_accts" -v hudf="$f_hud" '
+  -v newsf="$f_news" -v sigf="$f_sig" -v l3f="$f_l3" -v swarmf="$f_swarm" -v acktf="$f_accts" -v hudf="$f_hud" '
 BEGIN {
   esc = sprintf("%c", 27)
   reset = esc "[0m"
@@ -529,6 +610,7 @@ function fit(s, limit,   out, i, n, c, j, vis, plain, w) {
 FILENAME == newsf { fit($0, max); next }
 FILENAME == sigf  { fit($0, max); next }
 FILENAME == l3f   { fit($0, max); next }
+FILENAME == swarmf { fit($0, max); next }
 FILENAME == acktf { accts = accts $0 "\n"; next }
 
 FILENAME == hudf {
@@ -554,7 +636,7 @@ END {
   if (divider != "") { d = divider; if (nocolor != "") gsub(ansi, "", d); print d }
   n = split(hud_bot, rows, "\n"); for (i = 1; i <= n; i++) if (rows[i] != "") fit(rows[i], max)
 }
-' "$f_news" "$f_sig" "$f_l3" "$f_accts" "$f_hud"
+' "$f_news" "$f_sig" "$f_l3" "$f_swarm" "$f_accts" "$f_hud"
 
 # Statusline should never break Claude Code.
 exit 0
